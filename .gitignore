@@ -11,3 +11,7 @@
 /notebooks/01_reproductions/Stock_trend_RQA_transposed_transformer/__pycache__/
 /results
 /notebooks/tables
+/plans
+/src/condpred/__pycache__
+/src/condpred/features/__pycache__
+/src/condpred/experiments/__pycache__

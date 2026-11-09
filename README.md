@@ -59,14 +59,15 @@ Run every notebook from its own folder (Jupyter and PyCharm do this by default).
 RecPlay/
 ├── src/recplay/          shared RP / RQA code (imported by the 02_macro screening notebooks)
 ├── src/rpjepa/           synthetic tasks, RP encoders and JEPA pretraining (imported by 05_jepa)
-├── dashboard/            visual tour of the constructed systems (open index.html)
+├── dashboard/            static HTML dashboards; `torp_triplets.html` (built by `06_torp/triplet_dashboard.py`)
 ├── notebooks/
 │   ├── 00_foundations/     exercises and first experiments
 │   ├── 01_reproductions/   reproductions of published results
 │   ├── 02_macro/           US macro series
 │   ├── 03_equity_indices/  stock indices and RP computation benchmarks
 │   ├── 04_predictability/  RQA measures as predictability gauges
-│   └── 05_jepa/            JEPA self-supervised learning on recurrence plots (synthetic)
+│   ├── 05_jepa/            JEPA self-supervised learning on recurrence plots (synthetic)
+│   └── 06_torp/            third-order recurrence across three financial series
 ├── data/raw/             source data, not tracked in git
 ├── data/processed/       notebook caches, not tracked in git
 └── results/tables/       tables written by notebooks
@@ -99,6 +100,10 @@ RecPlay/
 | 05 | `04_torp_multiscale` | Third-order RPs (Boussé et al. 2023): exact check that a perimeter TORP is a function of D while generalised cosine is not; supervised `sign` (x vs −x) and `direction` (forward vs reversed) diagnostics for D, cosine, perimeter / gencos TORPs (3D CNN and 3D S4ND), RQA features and raw attention; coarse-to-fine multiscale JEPA targets over recurrence rates vs single-scale. Result: only odd-order gencos TORPs beat chance on `sign` (0.88–0.89 on 2 of 3 seeds; D, cosine, perimeter TORP and RQA exactly 0.50), raw series solves it at 0.998; multiscale targets no gain (0.504 vs 0.510) | synthetic |
 | 05 | `05_nearest_pattern_rule` | Recall: hand-written nearest-pattern and soft (distance-weighted) retrieval rules vs RP + CNN and attention on the same splits, over window length, number of pairs and query noise. Result: the nearest rule solves every noise-free setting (R² ≥ 0.999, ~540 FLOPs per window); with a noisy query RP + CNN matches the soft rule (0.611 vs 0.605 at noise 0.25) but never beats the best rule | synthetic |
 | 05 | `06_series_only_rp` | RP + CNN with only the two series-value channels (no distance channel) on recall and the other tasks, plus depth 3 and smaller training sets. Result: partial (pre-registered): recall 0.933 vs 0.998 with D (0.973 at depth 3); D makes learning start ~12 epochs earlier and is needed at 5,000 training windows (0.970 vs 0.000) | synthetic |
+| 06 | `01_triplet_perimeter` | Perimeter TORP $T_{ijk} = d(x_i, y_j) + d(x_i, z_k) + d(y_j, z_k)$ (Euclidean) across three daily return series, for eight triplets chosen by correlation pattern (none, mid, high, one-out, mixed-sign); 10 yearly windows, m = 3, τ = 1, RR = 5 %, plus VIX sign-flip. Result: same-time dissimilarity $D_{sync}/D_{all}$ follows $\tfrac13\sum\sqrt{1-r}$ (Spearman 0.991); anti-correlation reads as dissimilarity, and high mixed-sign averages like no correlation (0.98 vs 0.97) though the thresholded tensor separates them (same-time RR 2.4× vs 1.3× base) | Yahoo daily ETFs and `^VIX`, 2015–2024 |
+| 06 | `triplet_dashboard.py` (script) | Builds `dashboard/torp_triplets.html` (open in a browser, no server): per triplet and yearly window, a 3D cloud of the daily z-scored returns with the (1, 1, 1) direction and the principal axis, the thresholded perimeter TORP on a movable sub-cube of (i, j, k) with the same-time diagonal marked, and the same-day dissimilarity $T_{ttt}$ through the window. Uses the notebook's ε and price cache; downloads Plotly.js once to `dashboard/vendor/` | output of `01_triplet_perimeter` |
+| 06 | `02_individual_rqa_torp` | Perimeter TORP on RQA vectors of each series (DET, L, ENTR, LAM, K2; sliding windows W = 250 every 10 days, per-series RR = 15 %), pooled z-score, Euclidean vs Mahalanobis. Result: features nearly one direction (L–ENTR 0.99); same-window closeness follows mean \|r\| (Spearman −0.81 Mahalanobis, n = 8) but not its sign, so high mixed-sign sits next to high +; crisis windows of 2020 dominate | Yahoo daily ETFs and `^VIX`, 2015–2024 |
+| 06 | `03_joint_rqa_torp` | Same on RQA vectors of the three pairwise joint RPs (joint RR kept), as excess over a null pair with one series shifted by 250 days; raw-feature comparison. Result: excess joint RR tracks \|r\| over 23 pairs (Spearman 0.94; signed r 0.36); same-window closeness of the three relationships follows mean \|r\| (−0.83) more than their unevenness (+0.43) | Yahoo daily ETFs and `^VIX`, 2015–2024 |
 
 ## Library (`src/recplay`)
 
@@ -109,9 +114,10 @@ RecPlay/
 | `rqa` | diagonal/vertical line lengths, `rqa` measures, `k2_lines` |
 | `connectivity` | `rr_critical`: RRc, the RR at which an 8-connected recurrence cluster first links the first δN rows to the last δN columns (union–find); `omega_ranks` for joint RPs |
 | `surrogates` | `iaaft` surrogates |
-| `windowed` | sliding-window RQA (plus the current state's recurrence rate, `RR_last`) and RRc (with IAAFT-surrogate null) feature frames; Euclidean on z or exp(z), or β-divergence distance |
+| `windowed` | sliding-window RQA (plus the current state's recurrence rate, `RR_last`; windows every `step` rows) and RRc (with IAAFT-surrogate null) feature frames; Euclidean on z or exp(z), or β-divergence distance |
 | `analogue` | `analogue_frame`: the current state's recurrences with the whole past and the share of them followed by a rise h months later |
 | `dependence` | independence ratios and joint covariance/correlation for pairs and triples |
+| `torp` | `cross_distances` between two state arrays; `perimeter_tensor` (sum of pairwise dissimilarities of three state arrays, any `distance`; a = b = c gives the single-series TORP); `threshold_tensor_by_rate`; `whitening_matrix` (Mahalanobis via Σ^(-1/2)); `same_time_stats` (same-time diagonal vs whole tensor) |
 
 Conventions: Euclidean distance unless stated; ε chosen per series so the recurrence rate equals a target
 (default 0.10); rates counted over upper-triangle pairs (i < j); a Theiler window is applied by only counting
@@ -139,6 +145,7 @@ pairs with j − i ≥ `min_sep`.
 | `data/raw/oecd_mei/` | FRED CSV downloads of OECD MEI CPI indices `<ISO>CPIALLMINMEI` (monthly, not seasonally adjusted) | Downloaded automatically by `CPI_direction_crosscountry` on first run (28 Oct 2026); most series end in early 2025, Japan in 2021 |
 | `data/raw/goyal_welch/Goyal_Welch_2025.xlsx` | Goyal & Welch equity-premium predictor data, 2025 update, `Monthly` sheet | 1871–2025 |
 | `data/raw/yahoo/` | yfinance timezone cache | Created automatically; prices are downloaded live and change between runs |
+| `data/raw/yahoo/triplet_prices_2015_2024.csv` | yfinance daily adjusted closes of the `06_torp` tickers, US trading days | Written by `01_triplet_perimeter` on first run; delete to re-download |
 | `data/raw/stock_trend_tushare/` | Tushare `stk_mins`, `trade_cal`, `daily` | Raw gzip CSV responses with metadata/SHA256 checks; no historical data supplied |
 | `data/processed/stock_trend_repro/{full,smoke}/` | Stock-trend notebook | Code/input-fingerprinted RQA caches, epoch selections, neural checkpoints and predictions; synthetic smoke kept separate |
 | `data/processed/rp_screening/` | Caches of the screening notebooks: `iaaft/` window surrogates (shared), `euclidean/` and `beta/` RQA and RRc features | Delete a folder after changing the code that builds it |
@@ -156,6 +163,8 @@ pairs with j − i ≥ `min_sep`.
 | `results/tables/det_predictability_window_sweep.csv` | `DETPredictability` |
 | `results/tables/stock_trend_repro/{full,smoke}/<run hash>/` | `Stock_trend_RQA_transposed_transformer`: predictions, seed/stock summaries, published-reference comparisons, ablations, coverage, manifest and diagnostic figures; full-mode `missing_data.csv` lists unavailable source ranges |
 | `results/tables/jepa/step{1,…,6}/` | the six `05_jepa` notebooks: result tables, `figures/` and, for steps 5–6, the full-run `run.log` |
+| `notebooks/tables/torp_triplets/` | `01_triplet_perimeter`: per-window and summary tables, embedding diagnostics, `figures/` |
+| `notebooks/tables/torp_rqa_individual/`, `notebooks/tables/torp_rqa_joint/` | `02_individual_rqa_torp`, `03_joint_rqa_torp`: summary per triplet and distance variant, same-window dissimilarity per window, relation to the correlation pattern, `figures/` (joint: also `pair_dependence.csv`) |
 
 ## References
 

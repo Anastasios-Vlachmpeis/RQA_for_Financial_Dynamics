@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Triplet perimeter TORP — 3D dashboard</title>
+<script src="vendor/plotly-2.35.2.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; background: #fafafa; color: #222; }
+  header { padding: 10px 16px; background: #fff; border-bottom: 1px solid #ddd; display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
+  header h1 { font-size: 16px; margin: 0 12px 0 0; }
+  label { font-size: 13px; }
+  select, input { font-size: 13px; margin-left: 4px; }
+  #stats { font-size: 12.5px; padding: 6px 16px; background: #fff; border-bottom: 1px solid #eee; }
+  #stats b { font-weight: 600; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 8px; }
+  .panel { background: #fff; border: 1px solid #ddd; border-radius: 4px; }
+  .note { font-size: 12px; color: #555; padding: 4px 10px 8px; }
+  #cloud, #torp { height: 560px; }
+  #sync { height: 260px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Triplet perimeter TORP</h1>
+  <label>Triplet <select id="variant"></select></label>
+  <label>Window <select id="window"></select></label>
+  <label>Cloud colour <select id="colour"><option value="sync">same-day D / mean D</option><option value="time">time in window</option></select></label>
+  <label>Cube start <input id="cubeStart" type="range" min="0" value="0"><span id="cubeStartVal"></span></label>
+  <label>Cube size <select id="cubeSize"><option>30</option><option selected>50</option><option>70</option></select></label>
+</header>
+<div id="stats"></div>
+<div class="row">
+  <div class="panel"><div id="cloud"></div>
+    <div class="note">Each point is one day: z-scored returns of the three series. Grey: all three move together (1, 1, 1). Red: the cloud's principal axis. A round cloud = no correlation; a cigar along (1, 1, 1) = high positive; along (1, 1, −1) etc. = mixed sign.</div></div>
+  <div class="panel"><div id="torp"></div>
+    <div class="note">Cells (i, j, k) with T<sub>ijk</sub> = d(a<sub>i</sub>, b<sub>j</sub>) + d(a<sub>i</sub>, c<sub>k</sub>) + d(b<sub>j</sub>, c<sub>k</sub>) ≤ ε, ε from the notebook (5 % of the full window's tensor). Darker = smaller T. Red: the same-time diagonal i = j = k that is below ε.</div></div>
+</div>
+<div class="row" style="grid-template-columns: 1fr;">
+  <div class="panel"><div id="sync"></div></div>
+</div>
+<script>
+const DATA = /*__DATA__*/null;
+const { M, TAU, W } = DATA;
+const $ = id => document.getElementById(id);
+
+DATA.variants.forEach((v, i) => $("variant").add(new Option(
+  `${v.category}${v.variant === "original" ? "" : " (" + v.variant + ")"}: ${v.tickers.join(", ")}`, i)));
+DATA.windows.forEach((w, i) => $("window").add(new Option(w.label, i)));
+$("window").value = DATA.windows.length - 1;
+
+const mean = a => a.reduce((s, x) => s + x, 0) / a.length;
+function zscore(x) { const mu = mean(x); const sd = Math.sqrt(mean(x.map(a => (a - mu) ** 2))); return x.map(a => (a - mu) / sd); }
+function embedStates(z) {                  // recplay.embedding.embed: state t = (z_t, z_{t+τ}, …)
+  const n = z.length - (M - 1) * TAU, out = new Array(n);
+  for (let t = 0; t < n; t++) { const s = new Float64Array(M); for (let l = 0; l < M; l++) s[l] = z[t + l * TAU]; out[t] = s; }
+  return out;
+}
+function dist(p, q) { let s = 0; for (let l = 0; l < M; l++) s += (p[l] - q[l]) ** 2; return Math.sqrt(s); }
+
+function windowData(v, w) {
+  const s0 = DATA.windows[w].start;
+  const z = v.tickers.map((t, q) => zscore(DATA.returns[t].slice(s0, s0 + W).map(r => r * v.sign[q])));
+  return { z, states: z.map(embedStates), dates: DATA.dates.slice(s0, s0 + W) };
+}
+
+function principalAxis(z) {
+  const C = [0, 1, 2].map(p => [0, 1, 2].map(q => mean(z[p].map((x, t) => x * z[q][t]))));
+  let v = [1, 1, 1];
+  for (let it = 0; it < 200; it++) {
+    const u = C.map(row => row[0] * v[0] + row[1] * v[1] + row[2] * v[2]);
+    const nrm = Math.hypot(...u); v = u.map(x => x / nrm);
+  }
+  return v;
+}
+
+function render() {
+  const v = DATA.variants[+$("variant").value], w = +$("window").value, st = v.windows[w];
+  const { z, states, dates } = windowData(v, w);
+  const [A, B, Cc] = states, n = A.length, lab = v.tickers.map((t, q) => (v.sign[q] < 0 ? "−" : "") + t);
+
+  // same-day dissimilarity T_ttt, checked against the notebook's same-day recurrence rate
+  const Tttt = A.map((_, t) => dist(A[t], B[t]) + dist(A[t], Cc[t]) + dist(B[t], Cc[t]));
+  const rrSync = Tttt.filter(x => x <= st.eps).length / n;
+  const syncRatio = mean(Tttt) / st.D_all;
+  $("stats").innerHTML =
+    `<b>r</b>(${lab[0]}, ${lab[1]}) = ${st.r_ab.toFixed(2)}, (${lab[0]}, ${lab[2]}) = ${st.r_ac.toFixed(2)}, (${lab[1]}, ${lab[2]}) = ${st.r_bc.toFixed(2)} &nbsp;|&nbsp; ` +
+    `<b>D<sub>sync</sub>/D<sub>all</sub></b> = ${syncRatio.toFixed(3)} (notebook ${st.sync_ratio.toFixed(3)}, predicted ${st.predicted_ratio.toFixed(3)}) &nbsp;|&nbsp; ` +
+    `<b>same-day RR</b> = ${rrSync.toFixed(3)} (notebook ${st.RR_sync.toFixed(3)}) = ${(rrSync / DATA.RR).toFixed(2)}× base &nbsp;|&nbsp; ε = ${st.eps.toFixed(3)}`;
+
+  // 1. return cloud: day t + (M-1)τ is the latest sample of state t
+  const off = (M - 1) * TAU, idx = [...Array(n).keys()].map(t => t + off);
+  const colour = $("colour").value === "sync" ? Tttt.map(x => x / st.D_all) : idx;
+  const ax = principalAxis(z), L = 4, one = 1 / Math.sqrt(3);
+  const axisLine = vec => ({ x: [-L * vec[0], L * vec[0]], y: [-L * vec[1], L * vec[1]], z: [-L * vec[2], L * vec[2]] });
+  Plotly.react("cloud", [
+    { type: "scatter3d", mode: "markers", x: idx.map(t => z[0][t]), y: idx.map(t => z[1][t]), z: idx.map(t => z[2][t]),
+      text: idx.map(t => dates[t]), marker: { size: 3, color: colour, colorscale: "Viridis", reversescale: $("colour").value === "sync",
+      colorbar: { title: $("colour").value === "sync" ? "T_ttt / mean T" : "day", len: 0.6 }, opacity: 0.85 },
+      hovertemplate: "%{text}<br>%{x:.2f}, %{y:.2f}, %{z:.2f}<extra></extra>", name: "days" },
+    { type: "scatter3d", mode: "lines", ...axisLine([one, one, one]), line: { color: "#555", width: 5 }, name: "(1,1,1)" },
+    { type: "scatter3d", mode: "lines", ...axisLine(ax), line: { color: "#d62728", width: 6 }, name: "principal axis" },
+  ], { title: { text: `Daily returns, ${DATA.windows[w].label}`, font: { size: 14 } }, margin: { l: 0, r: 0, t: 36, b: 0 }, showlegend: false, uirevision: "cloud",
+       scene: { xaxis: { title: lab[0] }, yaxis: { title: lab[1] }, zaxis: { title: lab[2] }, aspectmode: "cube",
+                camera: { eye: { x: 1.9, y: -1.1, z: 0.5 } } } });
+
+  // 2. thresholded perimeter TORP on a sub-cube of state indices
+  const size = +$("cubeSize").value, slider = $("cubeStart");
+  slider.max = n - size; if (+slider.value > n - size) slider.value = n - size;
+  const s = +slider.value; $("cubeStartVal").textContent = ` ${s}–${s + size - 1}`;
+  const xs = [], ys = [], zs = [], ts = [], dx = [], dy = [], dz = [];
+  const dAB = [], dAC = [], dBC = [];
+  for (let i = 0; i < size; i++) { dAB.push([]); dAC.push([]); dBC.push([]);
+    for (let j = 0; j < size; j++) { dAB[i].push(dist(A[s + i], B[s + j])); dAC[i].push(dist(A[s + i], Cc[s + j])); dBC[i].push(dist(B[s + i], Cc[s + j])); } }
+  for (let i = 0; i < size; i++) for (let j = 0; j < size; j++) for (let k = 0; k < size; k++) {
+    const T = dAB[i][j] + dAC[i][k] + dBC[j][k];
+    if (T <= st.eps) { if (i === j && j === k) { dx.push(s + i); dy.push(s + j); dz.push(s + k); } else { xs.push(s + i); ys.push(s + j); zs.push(s + k); ts.push(T); } }
+  }
+  const share = (xs.length + dx.length) / size ** 3;
+  Plotly.react("torp", [
+    { type: "scatter3d", mode: "markers", x: xs, y: ys, z: zs, marker: { size: 2.2, color: ts, colorscale: "Greys", opacity: 0.55,
+      colorbar: { title: "T_ijk", len: 0.6 } }, hovertemplate: "i %{x}, j %{y}, k %{z}<br>T = %{marker.color:.2f}<extra></extra>", name: "T ≤ ε" },
+    { type: "scatter3d", mode: "markers", x: dx, y: dy, z: dz, marker: { size: 5, color: "#d62728" }, hovertemplate: "same time t = %{x}<extra></extra>", name: "i = j = k" },
+    { type: "scatter3d", mode: "lines", x: [s, s + size - 1], y: [s, s + size - 1], z: [s, s + size - 1], line: { color: "#d62728", width: 2, dash: "dot" }, hoverinfo: "skip" },
+  ], { title: { text: `Thresholded TORP, states ${s}–${s + size - 1}: ${(100 * share).toFixed(1)} % of cells recur`, font: { size: 14 } },
+       margin: { l: 0, r: 0, t: 36, b: 0 }, showlegend: false,
+       scene: { xaxis: { title: `i (${lab[0]})` }, yaxis: { title: `j (${lab[1]})` }, zaxis: { title: `k (${lab[2]})` }, aspectmode: "cube" } });
+
+  // 3. same-day dissimilarity through the window
+  const ratio = Tttt.map(x => x / st.D_all), d = idx.map(t => dates[t]);
+  Plotly.react("sync", [
+    { x: d, y: ratio, mode: "lines", line: { width: 1, color: "#1f77b4" }, name: "T_ttt / mean T" },
+    { x: d.filter((_, t) => Tttt[t] <= st.eps), y: ratio.filter((_, t) => Tttt[t] <= st.eps), mode: "markers", marker: { color: "#d62728", size: 5 }, name: "T_ttt ≤ ε" },
+    { x: [d[0], d[n - 1]], y: [st.eps / st.D_all, st.eps / st.D_all], mode: "lines", line: { dash: "dot", color: "#d62728" }, name: "ε / mean T" },
+    { x: [d[0], d[n - 1]], y: [1, 1], mode: "lines", line: { dash: "dash", color: "#888" }, name: "mean over all time triples" },
+  ], { title: { text: "Same-day triplet dissimilarity through the window", font: { size: 14 } }, margin: { l: 50, r: 10, t: 36, b: 40 },
+       yaxis: { title: "T_ttt / mean T" }, legend: { orientation: "h", y: 1.12, x: 0.5, xanchor: "center" },
+       shapes: [{ type: "rect", xref: "x", yref: "paper", x0: d[s] ?? d[0], x1: d[Math.min(s + size - 1, n - 1)], y0: 0, y1: 1, fillcolor: "#d62728", opacity: 0.07, line: { width: 0 } }] });
+}
+
+["variant", "window", "colour", "cubeSize"].forEach(id => $(id).addEventListener("change", render));
+$("cubeStart").addEventListener("input", render);
+render();
+</script>
+</body>
+</html>

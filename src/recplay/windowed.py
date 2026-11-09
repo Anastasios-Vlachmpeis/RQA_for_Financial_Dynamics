@@ -36,19 +36,20 @@ def exp_euclidean_distance(z: np.ndarray, m: int, tau: int) -> np.ndarray:
 
 
 def rqa_frame(data: pd.DataFrame, series: dict, joints: dict, W: int, m: int, tau: int, rr: float,
-              distance, theiler: int = 1) -> pd.DataFrame:
+              distance, theiler: int = 1, step: int = 1) -> pd.DataFrame:
     """rqa() of every single-series RP (thresholded at rate rr) and every joint RP, columns '<prefix>_<measure>'.
 
     Also RR_last: the recurrence rate of the window's last state (the current month) with the rest of the window.
+    Windows end every `step` rows, starting at row W - 1.
     """
     arrays = {p: data[c].to_numpy(dtype=float) for p, c in series.items()}
     rows = []
-    for end in range(W - 1, len(data)):
+    for end in range(W - 1, len(data), step):
         R = {p: threshold_by_rate(distance(window_z(x, end, W), m, tau), rr, theiler) for p, x in arrays.items()}
         R.update({j: R[a] & R[b] for j, (a, b) in joints.items()})
         rows.append({f"{p}_{k}": v for p, Rp in R.items()
                      for k, v in {**rqa(Rp), "RR_last": Rp[-1].sum() / (len(Rp) - theiler)}.items()})
-    return pd.DataFrame(rows, index=data.index[W - 1 :])
+    return pd.DataFrame(rows, index=data.index[W - 1 :: step])
 
 
 def window_surrogates(data: pd.DataFrame, series: dict, W: int, n_surr: int) -> dict:
