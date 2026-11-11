@@ -326,6 +326,46 @@ def ftle_at_t(system: str, traj: Trajectory, t: int, h: int) -> float:
     return np.nan
 
 
+def _rossler_rhs(s, a=0.2, b=0.2, c=5.7):
+    return np.array([-s[1] - s[2], s[0] + a * s[1], b + s[2] * (s[0] - c)])
+
+
+def _rossler_jac(s, a=0.2, b=0.2, c=5.7):
+    return np.array([[0, -1, -1], [1, a, 0], [0, 1, s[0] - c]])
+
+
+def ftle_at_rows(system: str, traj: Trajectory, ts, h: int) -> np.ndarray:
+    """True FTLE over [t, t+h] at each t in ``ts`` (clean trajectory, per-sample units)."""
+    ts = np.asarray(list(ts), int)
+    out = np.full(len(ts), np.nan)
+    if len(ts) == 0 or traj.state is None and system in ("henon", "lorenz63", "rossler"):
+        return out
+    if system == "logistic":
+        arr = ftle_logistic(traj.x, r=3.9, h=h)
+    elif system == "henon":
+        arr = ftle_map(lambda s: _henon_jac(s), traj.state, h)
+    elif system in ("lorenz63", "rossler"):
+        # Re-integrate only from the first requested t (true state there) to bound cost.
+        start = int(ts.min())
+        n = int(ts.max()) - start + h + 1
+        if system == "lorenz63":
+            expon, _ = ftle_flow(lorenz_rhs, lorenz_jacobian, traj.state[start], 0.01, 5, n, h, sub=5, burn=0)
+            arr_full = expon * 0.05  # per time unit -> per sample (scale-invariant for Spearman)
+        else:
+            expon, _ = ftle_flow(_rossler_rhs, _rossler_jac, traj.state[start], 0.05, 4, n, h, sub=1, burn=0)
+            arr_full = expon * 0.2
+        idx = ts - start
+        ok = (idx >= 0) & (idx < len(arr_full))
+        out[ok] = arr_full[idx[ok]]
+        return out
+    else:
+        return out
+    idx = ts
+    ok = (idx >= 0) & (idx < len(arr))
+    out[ok] = arr[idx[ok]]
+    return out
+
+
 def _geom(m: int, tau: int, spec_geom: dict) -> Geometry:
     g = Geometry(
         scaling=spec_geom.get("scaling", "wz"),
@@ -368,6 +408,26 @@ def _rqa_feature_row(
         lr = {k: np.nan for k in LRQA_KEYS}
     for k in LRQA_KEYS:
         row[f"lrqa_{k}"] = lr.get(k, np.nan)
+    return row
+
+
+def _lrqa_feature_row(x, t, W, m, tau, geom) -> dict:
+    """B scalars + LRQA only (secondaries 3/4/8 test M1b; WRQA not needed)."""
+    row: dict = {}
+    for k, v in baselines.level_features(x, t, W).items():
+        row[k] = v
+    row["perm_entropy"] = baselines.perm_entropy(x, W, t, order=4)
+    row["rolling_var"] = baselines.rolling_var(x, W, t)
+    for i, v in enumerate(baselines.state_location(x, t, m, tau)):
+        row[f"state_loc_{i}"] = float(v)
+    try:
+        lr = local_rqa(x, t, W, m, tau, geom)
+    except (IndexError, ValueError):
+        lr = {k: np.nan for k in LRQA_KEYS}
+    for k in LRQA_KEYS:
+        row[f"lrqa_{k}"] = lr.get(k, np.nan)
+    for k in WRQA_KEYS:
+        row[f"wrqa_{k}"] = np.nan
     return row
 
 
@@ -415,12 +475,12 @@ def build_rqa_frame(
     geom: Geometry,
     step: int,
     n_jobs: int = -1,
+    lrqa_only: bool = False,
 ) -> pd.DataFrame:
     min_t = seg.start + max(W, (m - 1) * tau)
     ts = list(range(min_t, seg.stop, step))
-    rows = Parallel(n_jobs=n_jobs)(
-        delayed(_rqa_feature_row)(x, t, W, m, tau, geom) for t in ts
-    )
+    fn = _lrqa_feature_row if lrqa_only else _rqa_feature_row
+    rows = Parallel(n_jobs=n_jobs)(delayed(fn)(x, t, W, m, tau, geom) for t in ts)
     df = pd.DataFrame(rows, index=ts)
     df.index.name = "t"
     return df
@@ -574,7 +634,26 @@ def e1_overall_pass(decision_rows: list[dict]) -> bool:
     return n_sys_pass >= 2
 
 
-def build_decision_table(primary_results: list[dict], smoke_mode: bool) -> list[dict]:
+def _read_e2_pass(out_dir) -> bool | None:
+    """E2 full verdict from its decision.csv; None when the file/row is missing."""
+    out_dir = Path(out_dir)
+    candidates = [out_dir.parent / "E2" / "decision.csv", out_dir.parent.parent / "E2" / "decision.csv"]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            df = pd.read_csv(path)
+        except Exception:
+            continue
+        if "smoke" in df.columns and df["smoke"].fillna(False).astype(bool).all():
+            continue
+        rows = df[df["gate"].astype(str) == "E2"] if "gate" in df.columns else df.iloc[0:0]
+        if len(rows) and "verdict" in df.columns:
+            return str(rows.iloc[0]["verdict"]).strip().lower() == "pass"
+    return None
+
+
+def build_decision_table(primary_results: list[dict], smoke_mode: bool, e2_pass: bool | None = None) -> list[dict]:
     rows = []
     for r in primary_results:
         rows.append(
@@ -604,17 +683,23 @@ def build_decision_table(primary_results: list[dict], smoke_mode: bool) -> list[
             "verdict": "pass" if e1_pass else "fail",
         }
     )
+    if e1_pass or e2_pass:
+        g1_verdict, g1_value = "pass", True
+    elif e2_pass is False:
+        g1_verdict, g1_value = "fail", False
+    else:
+        g1_verdict, g1_value = "pending", np.nan
     rows.append(
         {
             "gate": "G1",
             "system": "all",
             "horizon": "all",
             "statistic": "E1_pass OR E2_pass",
-            "value": e1_pass,
+            "value": g1_value,
             "ci_low": np.nan,
             "ci_high": np.nan,
-            "rule": "E2 not run; G1 = E1_pass",
-            "verdict": "pass" if e1_pass else "fail",
+            "rule": "G1 = E1 pass OR E2 pass (E2 read from its full decision.csv); pending only if that file is missing",
+            "verdict": g1_verdict,
         }
     )
     if smoke_mode:
@@ -673,6 +758,50 @@ def load_trajectories(spec: dict, cache_prefix: str) -> dict[tuple[str, int], Tr
     return out
 
 
+def _build_packs(spec, trajectories, horizons_map, emb_choice, *, sigma, W, forecaster_kind="knn", scaling=None, lrqa_only=False, loss_by_h_map=None, label="packs"):
+    """Packs per (system, h, seed): losses + RQA frames attached per horizon."""
+    bounds_map = bounds(spec["segments"])
+    lookback_lib = spec["segments"]["library"]
+    lib_end = bounds_map["library"].stop - 1
+    cal_start = bounds_map["calibration"].start
+    step = spec["step"]
+    n_jobs_feat = 1 if spec["smoke"] else 12
+    packs: list[dict] = []
+    for system in spec["systems"]:
+        horizons = horizons_map[system]
+        for seed in spec["seeds"]:
+            traj = trajectories[(system, seed)]
+            m, tau = emb_choice[(system, seed)]
+            x = apply_obs_noise(traj.x, sigma, seed)
+            var_lib = float(np.var(x[bounds_map["library"]]))
+            geom = _geom(m, tau, spec["geometry"])
+            geom.theiler = max(1, (m - 1) * tau)
+            if scaling is not None:
+                geom.scaling = scaling
+                if scaling == "gz":
+                    lib = x[bounds_map["library"]]
+                    geom.train_mean = float(np.mean(lib))
+                    geom.train_sd = float(np.std(lib))
+            print(f"E1 {label} {system} seed {seed} losses+features", flush=True)
+            if loss_by_h_map is not None:
+                loss_by_h = {h: loss_by_h_map[(system, seed, h)] for h in horizons}
+            elif forecaster_kind == "ar":
+                arf = ARFixed(p=5)
+                arf.fit(x[bounds_map["library"]])
+                loss_by_h = squared_loss_series(x, arf, horizons, 0, bounds_map["evaluation"].stop, var_lib, ar=True, cal_start=cal_start)
+            else:
+                knn = fit_knn(x[bounds_map["library"]], m, tau, horizons)
+                loss_by_h = squared_loss_series(x, knn, horizons, 0, bounds_map["evaluation"].stop, var_lib, cal_start=cal_start)
+            cal_rqa = build_rqa_frame(x, bounds_map["calibration"], W, m, tau, geom, step, n_jobs=n_jobs_feat, lrqa_only=lrqa_only)
+            ev_rqa = build_rqa_frame(x, bounds_map["evaluation"], W, m, tau, geom, step, n_jobs=n_jobs_feat, lrqa_only=lrqa_only)
+            for h in horizons:
+                loss_h = loss_by_h[h]
+                df_cal = attach_horizon(cal_rqa, x, h, loss_h, m, tau, lookback_lib, lib_end, bounds_map["calibration"].stop)
+                df_ev = attach_horizon(ev_rqa, x, h, loss_h, m, tau, lookback_lib, lib_end, bounds_map["evaluation"].stop)
+                packs.append({"system": system, "seed": seed, "h": h, "traj": traj, "x": x, "m": m, "tau": tau, "loss_h": loss_h, "cal": df_cal, "ev": df_ev, "cal_rqa": cal_rqa, "ev_rqa": ev_rqa})
+    return packs
+
+
 def run_primary_and_outputs(
     spec: dict,
     out_dir: Path,
@@ -691,151 +820,36 @@ def run_primary_and_outputs(
     n_boot = n_boot if n_boot is not None else smoke(500, 80)
     bounds_map = bounds(segs)
     lookback_lib = segs["library"]
+    lib_end = bounds_map["library"].stop - 1
 
     primary_rows = []
     seed_rows: list[dict] = []
-    packs: list[dict] = []
-    var_lib_cache: dict[tuple[str, int], float] = {}
-    lib_end = bounds_map["library"].stop - 1
-
-    n_jobs_feat = 1 if spec["smoke"] else 4
-    cal_start = bounds_map["calibration"].start
-    W = spec["W_primary"]
-    seed_bundle: dict[tuple[str, int], tuple] = {}
-
+    packs = _build_packs(spec, trajectories, horizons_map, emb_choice, sigma=spec["sigma_obs_primary"], W=spec["W_primary"], label="primary")
     for system in spec["systems"]:
-        horizons = horizons_map[system]
-        for h in horizons:
-            cal_frames, ev_frames, group_list = [], [], []
-            for seed in spec["seeds"]:
-                traj = trajectories[(system, seed)]
-                m, tau = emb_choice[(system, seed)]
-                x = apply_obs_noise(traj.x, spec["sigma_obs_primary"], seed)
-                if (system, seed) not in var_lib_cache:
-                    var_lib_cache[(system, seed)] = float(np.var(x[bounds_map["library"]]))
-                var_lib = var_lib_cache[(system, seed)]
-                geom = _geom(m, tau, spec["geometry"])
-                geom.theiler = max(1, (m - 1) * tau)
-                bundle_key = (system, seed)
-                if bundle_key not in seed_bundle:
-                    print(f"E1 bundle {system} seed {seed} losses+features", flush=True)
-                    knn = fit_knn(x[bounds_map["library"]], m, tau, horizons)
-                    loss_by_h = squared_loss_series(
-                        x,
-                        knn,
-                        horizons,
-                        0,
-                        bounds_map["evaluation"].stop,
-                        var_lib,
-                        cal_start=cal_start,
-                    )
-                    cal_rqa = build_rqa_frame(
-                        x,
-                        bounds_map["calibration"],
-                        W,
-                        m,
-                        tau,
-                        geom,
-                        step,
-                        n_jobs=n_jobs_feat,
-                    )
-                    ev_rqa = build_rqa_frame(
-                        x,
-                        bounds_map["evaluation"],
-                        W,
-                        m,
-                        tau,
-                        geom,
-                        step,
-                        n_jobs=n_jobs_feat,
-                    )
-                    seed_bundle[bundle_key] = (loss_by_h, cal_rqa, ev_rqa)
-
-                loss_by_h, cal_rqa, ev_rqa = seed_bundle[bundle_key]
-                loss_h = loss_by_h[h]
-                df_cal = attach_horizon(
-                    cal_rqa,
-                    x,
-                    h,
-                    loss_h,
-                    m,
-                    tau,
-                    lookback_lib,
-                    lib_end,
-                    bounds_map["calibration"].stop,
-                )
-                df_ev = attach_horizon(
-                    ev_rqa,
-                    x,
-                    h,
-                    loss_h,
-                    m,
-                    tau,
-                    lookback_lib,
-                    lib_end,
-                    bounds_map["evaluation"].stop,
-                )
-
-                cal_frames.append(df_cal)
-                ev_frames.append(df_ev)
-                group_list.append(column_groups(m))
-                packs.append(
-                    {
-                        "system": system,
-                        "seed": seed,
-                        "h": h,
-                        "traj": traj,
-                        "x": x,
-                        "m": m,
-                        "tau": tau,
-                        "loss_h": loss_h,
-                        "cal": df_cal,
-                        "ev": df_ev,
-                    }
-                )
-
-            res = primary_system_horizon(
-                cal_frames, ev_frames, group_list, "y", h, step, rng, n_boot
-            )
+        for h in horizons_map[system]:
+            sel = [p for p in packs if p["system"] == system and p["h"] == h]
+            sel.sort(key=lambda p: p["seed"])
+            cal_frames = [p["cal"] for p in sel]
+            ev_frames = [p["ev"] for p in sel]
+            group_list = [column_groups(p["m"]) for p in sel]
+            res = primary_system_horizon(cal_frames, ev_frames, group_list, "y", h, step, rng, n_boot)
             primary_rows.append({"system": system, "h": h, **res})
             d = res["delta"]
             print(f"E1 primary {system} h={h} delta={d:.4f}" if np.isfinite(d) else f"E1 primary {system} h={h} delta=nan", flush=True)
-            for si, (cal, ev, groups) in enumerate(zip(cal_frames, ev_frames, group_list)):
-                seed = spec["seeds"][si]
+            for p, cal, ev, groups in zip(sel, cal_frames, ev_frames, group_list):
                 p0, _, _ = fit_predict(cal, ev, groups["B"], "y")
                 p1, _, _ = fit_predict(cal, ev, groups["B"] + groups["LRQA"], "y")
                 y = ev["y"].to_numpy(float)
                 ok = np.isfinite(p0) & np.isfinite(p1) & np.isfinite(y)
-                d = (
-                    spearman(p1[ok], y[ok]) - spearman(p0[ok], y[ok])
-                    if ok.sum() >= 5
-                    else np.nan
-                )
-                seed_rows.append(
-                    {
-                        "system": system,
-                        "horizon": h,
-                        "seed": seed,
-                        "model": "M1b_vs_M0",
-                        "metric": "delta_spearman",
-                        "value": d,
-                        "ci_low": np.nan,
-                        "ci_high": np.nan,
-                    }
-                )
-
-    decision = build_decision_table(primary_rows, spec["smoke"])
+                d = spearman(p1[ok], y[ok]) - spearman(p0[ok], y[ok]) if ok.sum() >= 5 else np.nan
+                seed_rows.append({"system": system, "horizon": h, "seed": p["seed"], "model": "M1b_vs_M0", "metric": "delta_spearman", "value": d, "ci_low": np.nan, "ci_high": np.nan})
+    decision = build_decision_table(primary_rows, spec["smoke"], e2_pass=_read_e2_pass(out_dir))
     report.write_decision(decision, out_dir)
-
-    # results_primary.csv
     prim_df = pd.DataFrame(seed_rows)
     report.save_table(prim_df, out_dir, "results_primary")
     report.save_table(pd.DataFrame(primary_rows), out_dir, "results_primary_pooled")
-
-    secondary_all = _run_secondary_analyses(
-        spec, packs, horizons_map, bounds_map, lookback_lib, lib_end, rng, n_boot
-    )
-    for k, df in enumerate(secondary_all, 1):
+    secondary_all = _run_secondary_analyses(spec, packs, horizons_map, bounds_map, lookback_lib, lib_end, rng, n_boot, trajectories=trajectories, emb_choice=emb_choice)
+    for k, df in secondary_all.items():
         if df is not None and len(df):
             report.save_table(df, out_dir, f"results_secondary_{k}")
 
@@ -865,26 +879,71 @@ def run_full_pipeline(
     )
 
 
-def _secondary_delta(
-    cal_frames,
-    ev_frames,
-    group_list,
-    m1_cols_extra: list[str],
-    predictor: str = "ridge",
-) -> list[float]:
-    deltas = []
-    for cal, ev, groups in zip(cal_frames, ev_frames, group_list):
-        m0 = groups["B"]
-        m1 = groups["B"] + m1_cols_extra
-        p0, _, _ = fit_predict(cal, ev, m0, "y", predictor)
-        p1, _, _ = fit_predict(cal, ev, m1, "y", predictor)
+def _summarize_per_seed(values, *, fisher=False) -> dict:
+    """Mean per-seed effect with t CI / one-sample t p-value (exploratory secondaries)."""
+    v = np.asarray([x for x in values if np.isfinite(x)], float)
+    if len(v) == 0:
+        return {"value": np.nan, "ci_low": np.nan, "ci_high": np.nan, "p_value": 1.0, "n_seed": 0}
+    z = np.arctanh(np.clip(v, -0.999, 0.999)) if fisher else v
+    point = float(np.mean(v))
+    if len(v) < 3 or np.std(z, ddof=1) == 0:
+        return {"value": point, "ci_low": np.nan, "ci_high": np.nan, "p_value": 1.0 if point == 0 else 0.5, "n_seed": len(v)}
+    res = stats.ttest_1samp(z, 0.0)
+    se = float(np.std(z, ddof=1) / np.sqrt(len(z)))
+    crit = float(stats.t.ppf(0.975, len(z) - 1))
+    if fisher:
+        lo, hi = np.tanh(np.mean(z) - crit * se), np.tanh(np.mean(z) + crit * se)
+    else:
+        lo, hi = np.mean(z) - crit * se, np.mean(z) + crit * se
+    return {"value": point, "ci_low": float(lo), "ci_high": float(hi), "p_value": float(res.pvalue), "n_seed": len(v)}
+
+
+def _single_spearman(cal_frames, ev_frames, cols_list) -> list[float]:
+    vals = []
+    for cal, ev, cols in zip(cal_frames, ev_frames, cols_list):
+        pred, _, _ = fit_predict(cal, ev, cols, "y")
         y = ev["y"].to_numpy(float)
-        ok = np.isfinite(p0) & np.isfinite(p1) & np.isfinite(y)
-        if ok.sum() < 5:
-            deltas.append(np.nan)
-        else:
-            deltas.append(spearman(p1[ok], y[ok]) - spearman(p0[ok], y[ok]))
-    return deltas
+        ok = np.isfinite(pred) & np.isfinite(y)
+        vals.append(spearman(pred[ok], y[ok]) if ok.sum() >= 5 else np.nan)
+    return vals
+
+
+def _delta_rows_for(pack_list, spec, horizons_map, *, model_label, extra_fn, predictor="ridge", metric="delta_spearman"):
+    rows = []
+    for system in spec["systems"]:
+        for h in horizons_map[system]:
+            sel = sorted([p for p in pack_list if p["system"] == system and p["h"] == h], key=lambda p: p["seed"])
+            if not sel:
+                continue
+            cals = [p["cal"] for p in sel]
+            evs = [p["ev"] for p in sel]
+            gl = [column_groups(p["m"]) for p in sel]
+            if metric == "delta_spearman":
+                extras = [extra_fn(g) for g in gl]
+                deltas = []
+                for cal, ev, g, extra in zip(cals, evs, gl, extras):
+                    p0, _, _ = fit_predict(cal, ev, g["B"], "y", predictor)
+                    p1, _, _ = fit_predict(cal, ev, g["B"] + list(extra), "y", predictor)
+                    y = ev["y"].to_numpy(float)
+                    ok = np.isfinite(p0) & np.isfinite(p1) & np.isfinite(y)
+                    deltas.append(spearman(p1[ok], y[ok]) - spearman(p0[ok], y[ok]) if ok.sum() >= 5 else np.nan)
+                rows.append({"system": system, "horizon": h, "model": model_label, "metric": metric, **_summarize_per_seed(deltas)})
+            elif metric == "delta_auc_top":
+                from sklearn.metrics import roc_auc_score
+                deltas = []
+                for cal, ev, g in zip(cals, evs, gl):
+                    p0, _, _ = fit_predict(cal, ev, g["B"], "y", predictor)
+                    p1, _, _ = fit_predict(cal, ev, g["B"] + g["LRQA"], "y", predictor)
+                    loss_ev = ev["L"].to_numpy(float)
+                    thresh = float(np.nanquantile(cal["L"].to_numpy(float), 0.9))
+                    event = (loss_ev > thresh).astype(int)
+                    ok = np.isfinite(p0) & np.isfinite(p1) & np.isfinite(loss_ev)
+                    if ok.sum() < 10 or event[ok].sum() in (0, ok.sum()):
+                        deltas.append(np.nan)
+                        continue
+                    deltas.append(float(roc_auc_score(event[ok], p1[ok]) - roc_auc_score(event[ok], p0[ok])))
+                rows.append({"system": system, "horizon": h, "model": model_label, "metric": metric, **_summarize_per_seed(deltas)})
+    return rows
 
 
 def _holm_table(rows: list[dict], family: str) -> pd.DataFrame:
@@ -897,152 +956,134 @@ def _holm_table(rows: list[dict], family: str) -> pd.DataFrame:
     return df
 
 
-def _run_secondary_analyses(
-    spec,
-    packs,
-    horizons_map,
-    bounds_map,
-    lookback_lib,
-    lib_end,
-    rng,
-    n_boot,
-):
-    """Exploratory secondary families (Holm-corrected within each table)."""
-    from scipy.stats import norm
+def _run_secondary_analyses(spec, packs, horizons_map, bounds_map, lookback_lib, lib_end, rng, n_boot, trajectories=None, emb_choice=None):
+    """Exploratory secondaries 1-5, 7, 8 (6 is feature_vs_ftle); Holm within each table.
 
-    out: list[pd.DataFrame] = []
+    Effects are per-seed deltas summarised across seeds (mean, t CI, t p-value).
+    """
+    out: dict[int, pd.DataFrame] = {}
     if not packs:
         return out
-
-    def _collect(system, h, filt):
-        cals, evs, gl = [], [], []
-        for p in packs:
-            if p["system"] == system and p["h"] == h and filt(p):
-                cals.append(p["cal"])
-                evs.append(p["ev"])
-                gl.append(column_groups(p["m"]))
-        return cals, evs, gl
-
-    mid_h = {s: horizons_map[s][1] for s in spec["systems"]}
-
-    # 1 — M1a / M1c (ridge, primary W)
+    loss_map = {(p["system"], p["seed"], p["h"]): p["loss_h"] for p in packs}
+    # 1 — M1a / M1c at all horizons + single-family / single-B-member models
     rows = []
-    for system in spec["systems"]:
-        h = mid_h[system]
-        cals, evs, gl = _collect(system, h, lambda p: True)
-        if not gl:
-            continue
-        g0 = column_groups(max(p["m"] for p in packs if p["system"] == system and p["h"] == h))
-        for label, extra_cols in [
-            ("M1a", g0["WRQA"]),
-            ("M1c", g0["WRQA"] + g0["LRQA"]),
-        ]:
-            deltas = _secondary_delta(cals, evs, gl, extra_cols)
-            d = float(np.nanmean(deltas))
-            rows.append(
-                {
-                    "system": system,
-                    "horizon": h,
-                    "model": label,
-                    "metric": "delta_spearman",
-                    "value": d,
-                    "p_value": 1 - norm.cdf(d / 0.05) if np.isfinite(d) else 1.0,
-                }
-            )
-    if rows:
-        out.append(_holm_table(rows, "secondary_1_models"))
-
-    if spec["smoke"]:
-        return out
-
-    # 2 — LGBM predictor on primary setting
-    rows = []
+    rows += _delta_rows_for(packs, spec, horizons_map, model_label="M1a", extra_fn=lambda g: g["WRQA"])
+    rows += _delta_rows_for(packs, spec, horizons_map, model_label="M1c", extra_fn=lambda g: g["WRQA"] + g["LRQA"])
     for system in spec["systems"]:
         for h in horizons_map[system]:
-            cals, evs, gl = _collect(system, h, lambda p: True)
-            if not cals:
+            sel = sorted([p for p in packs if p["system"] == system and p["h"] == h], key=lambda p: p["seed"])
+            if not sel:
                 continue
-            g0 = column_groups(max(p["m"] for p in packs if p["system"] == system and p["h"] == h))
-            deltas = _secondary_delta(cals, evs, gl, g0["LRQA"], predictor="lgbm")
-            d = float(np.nanmean(deltas))
-            rows.append(
-                {
-                    "system": system,
-                    "horizon": h,
-                    "model": "M1b_lgbm",
-                    "metric": "delta_spearman",
-                    "value": d,
-                    "p_value": 1 - norm.cdf(d / 0.05) if np.isfinite(d) else 1.0,
-                }
-            )
+            cals = [p["cal"] for p in sel]
+            evs = [p["ev"] for p in sel]
+            gl = [column_groups(p["m"]) for p in sel]
+            g0 = gl[0]
+            singles = [("WRQA_only", g0["WRQA"]), ("LRQA_only", g0["LRQA"]), ("B_recent_loss", ["recent_loss"]), ("B_knn_spread", ["knn_spread"]), ("B_state_location", [c for c in g0["B"] if c.startswith("state_loc")]), ("B_level_features", ["level_cur", "level_mean", "level_vol_surprise"]), ("B_perm_entropy", ["perm_entropy"]), ("B_rolling_var", ["rolling_var"])]
+            for label, cols in singles:
+                vals = _single_spearman(cals, evs, [list(cols) for _ in gl])
+                rows.append({"system": system, "horizon": h, "model": label, "metric": "spearman_single", **_summarize_per_seed(vals, fisher=True)})
     if rows:
-        out.append(_holm_table(rows, "secondary_2_lgbm"))
-
-    # 7 — event AUC (top decile) M0 vs M1b
-    rows = []
-    for system in spec["systems"]:
-        h = mid_h[system]
-        cals, evs, gl = _collect(system, h, lambda p: True)
-        for cal, ev, groups in zip(cals, evs, gl):
-            m0 = groups["B"]
-            m1 = groups["B"] + groups["LRQA"]
-            p0, _, _ = fit_predict(cal, ev, m0, "y")
-            p1, _, _ = fit_predict(cal, ev, m1, "y")
-            y = ev["y"].to_numpy(float)
-            l_lin = np.exp(y) - 1e-4
-            from condpred.evaluation import compare
-
-            y_tr_lin = np.exp(cal["y"].to_numpy(float)) - 1e-4
-            cmp = compare(
-                p0,
-                p1,
-                y,
-                y_loss=l_lin,
-                y_train_loss=y_tr_lin,
-            )
-            dauc = cmp.get("auc_top", {}).get("delta", np.nan)
-            rows.append(
-                {
-                    "system": system,
-                    "horizon": h,
-                    "metric": "delta_auc_top",
-                    "value": dauc,
-                    "p_value": 1 - norm.cdf(dauc / 0.05) if np.isfinite(dauc) else 1.0,
-                }
-            )
+        out[1] = _holm_table(rows, "secondary_1_models")
+    # 2 — LGBM predictor, M1b
+    rows = _delta_rows_for(packs, spec, horizons_map, model_label="M1b_lgbm", extra_fn=lambda g: g["LRQA"], predictor="lgbm")
     if rows:
-        out.append(_holm_table(rows, "secondary_7_auc"))
-
+        out[2] = _holm_table(rows, "secondary_2_lgbm")
+    if trajectories is not None and emb_choice is not None:
+        # 3 — observation noise 0.05*sd, KNN, W=500, M1b (LRQA-only frames suffice)
+        noise_packs = _build_packs(spec, trajectories, horizons_map, emb_choice, sigma=0.05, W=spec["W_primary"], lrqa_only=True, label="secondary3_noise")
+        rows = _delta_rows_for(noise_packs, spec, horizons_map, model_label="M1b_noise0.05", extra_fn=lambda g: g["LRQA"])
+        if rows:
+            out[3] = _holm_table(rows, "secondary_3_noise")
+        del noise_packs
+        # 4 — W=200, M1b (primary losses reused)
+        w200_packs = _build_packs(spec, trajectories, horizons_map, emb_choice, sigma=spec["sigma_obs_primary"], W=spec["W_secondary"], lrqa_only=True, loss_by_h_map=loss_map, label="secondary4_W200")
+        rows = _delta_rows_for(w200_packs, spec, horizons_map, model_label="M1b_W200", extra_fn=lambda g: g["LRQA"])
+        if rows:
+            out[4] = _holm_table(rows, "secondary_4_W200")
+        del w200_packs
+        # 8 — geometry arms gz / rank for LRQA (primary losses reused)
+        rows8 = []
+        for scaling in ("gz", "rank"):
+            geom_packs = _build_packs(spec, trajectories, horizons_map, emb_choice, sigma=spec["sigma_obs_primary"], W=spec["W_primary"], scaling=scaling, lrqa_only=True, loss_by_h_map=loss_map, label=f"secondary8_{scaling}")
+            rows8 += _delta_rows_for(geom_packs, spec, horizons_map, model_label=f"M1b_geom_{scaling}", extra_fn=lambda g: g["LRQA"])
+            del geom_packs
+        if rows8:
+            out[8] = _holm_table(rows8, "secondary_8_geometry")
+    # 5 — AR(5) forecaster, primary RQA frames, M1b
+    ar_packs: list[dict] = []
+    ar_loss_cache: dict[tuple[str, int], dict] = {}
+    segs = spec["segments"]
+    for p in packs:
+        key = (p["system"], p["seed"])
+        if key not in ar_loss_cache:
+            x = p["x"]
+            arf = ARFixed(p=5)
+            arf.fit(x[bounds_map["library"]])
+            var_lib = float(np.var(x[bounds_map["library"]]))
+            ar_loss_cache[key] = squared_loss_series(x, arf, horizons_map[p["system"]], 0, bounds_map["evaluation"].stop, var_lib, ar=True, cal_start=bounds_map["calibration"].start)
+        loss_h = ar_loss_cache[key][p["h"]]
+        df_cal = attach_horizon(p["cal_rqa"], p["x"], p["h"], loss_h, p["m"], p["tau"], lookback_lib, lib_end, bounds_map["calibration"].stop)
+        df_ev = attach_horizon(p["ev_rqa"], p["x"], p["h"], loss_h, p["m"], p["tau"], lookback_lib, lib_end, bounds_map["evaluation"].stop)
+        ar_packs.append({**p, "cal": df_cal, "ev": df_ev, "loss_h": loss_h})
+    rows = _delta_rows_for(ar_packs, spec, horizons_map, model_label="M1b_AR5", extra_fn=lambda g: g["LRQA"])
+    if rows:
+        out[5] = _holm_table(rows, "secondary_5_AR5")
+    # 7 — event AUC (top decile, calibration threshold) M0 vs M1b, all horizons
+    rows = _delta_rows_for(packs, spec, horizons_map, model_label="M1b", extra_fn=lambda g: g["LRQA"], metric="delta_auc_top")
+    if rows:
+        out[7] = _holm_table(rows, "secondary_7_auc")
     return out
 
 
+def _partial_spearman(v, y, ctrl) -> float:
+    ok = np.isfinite(v) & np.isfinite(y) & np.isfinite(ctrl)
+    if ok.sum() < 10:
+        return np.nan
+    rv = stats.rankdata(v[ok])
+    ry = stats.rankdata(y[ok])
+    rc = stats.rankdata(ctrl[ok])
+    X = np.column_stack([np.ones(ok.sum()), rc])
+    bv, *_ = np.linalg.lstsq(X, rv, rcond=None)
+    by, *_ = np.linalg.lstsq(X, ry, rcond=None)
+    ev_ = rv - X @ bv
+    ey_ = ry - X @ by
+    if np.std(ev_) == 0 or np.std(ey_) == 0:
+        return np.nan
+    return float(np.corrcoef(ev_, ey_)[0, 1])
+
+
 def _feature_vs_ftle(packs, horizons_map) -> pd.DataFrame:
+    """Secondary 6: every WRQA/LRQA feature vs true FTLE, raw + partial on knn_spread."""
     rows = []
+    ftle_cache: dict[tuple[str, int, int], np.ndarray] = {}
     for p in packs:
         if p["h"] != horizons_map[p["system"]][1]:
             continue
         ev = p["ev"]
-        if "lrqa_K2_local" not in ev.columns:
-            continue
-        for feat in ["lrqa_K2_local", "wrqa_DET"]:
+        key = (p["system"], p["seed"], p["h"])
+        if key not in ftle_cache:
+            ftle_cache[key] = ftle_at_rows(p["system"], p["traj"], ev.index.to_numpy(), p["h"])
+        ftle = ftle_cache[key]
+        ctrl = ev["knn_spread"].to_numpy(float) if "knn_spread" in ev.columns else np.full(len(ev), np.nan)
+        feats = [f"wrqa_{k}" for k in WRQA_KEYS] + [f"lrqa_{k}" for k in LRQA_KEYS]
+        for feat in feats:
             if feat not in ev.columns:
                 continue
             v = ev[feat].to_numpy(float)
-            # FTLE proxy: log-loss (companion diagnostic)
-            ftle = ev["y"].to_numpy(float)
             ok = np.isfinite(v) & np.isfinite(ftle)
             if ok.sum() < 10:
-                continue
-            rho, _ = stats.spearmanr(v[ok], ftle[ok])
-            rows.append(
-                {
-                    "system": p["system"],
-                    "seed": p["seed"],
-                    "feature": feat,
-                    "spearman_ftle": float(rho),
-                }
-            )
-    return pd.DataFrame(rows)
+                rho, pval = np.nan, 1.0
+            else:
+                r = stats.spearmanr(v[ok], ftle[ok])
+                rho, pval = float(r[0]), float(r[1])
+            rows.append({"system": p["system"], "seed": p["seed"], "horizon": p["h"], "feature": feat, "spearman_ftle": rho, "p_value": pval, "partial_spearman_ftle_given_knn_spread": _partial_spearman(v, ftle, ctrl)})
+    if not rows:
+        return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    df["holm_p"] = holm([p if np.isfinite(p) else 1.0 for p in df["p_value"]])
+    df["family"] = "secondary_6_feature_vs_ftle"
+    df["exploratory"] = True
+    return df
 
 
 def _make_figures(primary_rows, horizons_map, spec, packs, fig_dir):
@@ -1091,11 +1132,16 @@ def _make_figures(primary_rows, horizons_map, spec, packs, fig_dir):
             report.save_fig(fig, fig_dir, "pred_vs_loss_scatter")
             plt.close(fig)
         if "lrqa_K2_local" in ev.columns:
+            try:
+                ftle_vals = ftle_at_rows(p0["system"], p0["traj"], ev.index.to_numpy(), p0["h"])
+            except Exception:
+                ftle_vals = np.full(len(ev), np.nan)
             fig, ax = plt.subplots(figsize=(4, 3))
-            ok = np.isfinite(ev["lrqa_K2_local"]) & np.isfinite(ev["y"])
-            ax.scatter(ev["lrqa_K2_local"][ok], ev["y"][ok], s=6, alpha=0.4)
+            k2 = ev["lrqa_K2_local"].to_numpy(float)
+            ok = np.isfinite(k2) & np.isfinite(ftle_vals)
+            ax.scatter(k2[ok], ftle_vals[ok], s=6, alpha=0.4)
             ax.set_xlabel("K2_local")
-            ax.set_ylabel("ln(loss)")
+            ax.set_ylabel("FTLE over [t, t+h]")
             fig.tight_layout()
             report.save_fig(fig, fig_dir, "ftle_vs_k2local")
             plt.close(fig)

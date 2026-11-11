@@ -7,13 +7,14 @@ PERC excluded: definition not approved by Tasos (01 §4.13).
 from __future__ import annotations
 
 import json
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy import stats
-
 from condpred import data as cdata
 from condpred import report
 from condpred.cache import cached
@@ -26,7 +27,7 @@ from condpred.geometry import Geometry
 from condpred.losses import log_ratio as _lr
 from condpred.losses import qlike as _ql
 from condpred.selfcheck import leakage_test
-from condpred.stats import giacomini_white, holm, panel_date_bootstrap
+from condpred.stats import holm
 
 E4_MODULES = [
     "condpred.experiments.e4",
@@ -59,8 +60,8 @@ COMPLETION_KEYS = frozenset({"universes", "om_sha256", "tier_a_snapshot", "binan
 def build_initial_spec(smoke_mode: bool) -> dict:
     return {
         "experiment": "E4",
-        "version": 3,
-        "changelog": ["v3: Oxford-Man dates fixed in condpred.data (label's first 10 chars = exchange-local date; duplicate (Symbol,date) assert); E4 reverted to om_quality cleaned output; variant cache keys, B_US features, per-asset target_end purge, >=250 training-row fold rule, loss_predictions keys, secondary CIs and Tier A/OM overlap fixed per REVIEW_07_E4_round1. Primary test unchanged.", "v2: E4-local OM universe (superseded by v3)."],
+        "version": 4,
+        "changelog": ["v4: REVIEW_07_E4_round1 A/B fixes: GW companion = OOS M0 residual (y_log-M0_pred) on per-asset-standardised LRQA with Driscoll-Kraay HAC (lags>=h) + Wald on LRQA coefs; B logv_mean5/22 = log of rolling mean v; log_bv = 22-day mean of log BV; vectorised/threaded CSR date-block bootstrap; vectorised loss_predictions assembly; geometry arms reuse primary M0. Primary test unchanged.", "v3: Oxford-Man dates fixed in condpred.data (label's first 10 chars = exchange-local date; duplicate (Symbol,date) assert); E4 reverted to om_quality cleaned output; variant cache keys, B_US features, per-asset target_end purge, >=250 training-row fold rule, loss_predictions keys, secondary CIs and Tier A/OM overlap fixed per REVIEW_07_E4_round1. Primary test unchanged.", "v2: E4-local OM universe (superseded by v3)."],
         "smoke": smoke_mode,
         "tiers": {"primary": "OM", "secondary": ["A", "BN"]},
         "om_source": "Oxford-Man archive via condpred.data.oxford_man (SHA-256 in manifest)",
@@ -340,14 +341,14 @@ def b_static(s: dict) -> pd.DataFrame:
     logv = np.log(v.clip(lower=1e-12))
     df = pd.DataFrame(index=s["dates"])
     df["logv"] = logv
-    df["logv_mean5"] = logv.rolling(5).mean()
-    df["logv_mean22"] = logv.rolling(22).mean()
+    df["logv_mean5"] = np.log(v.rolling(5).mean().clip(lower=1e-12))
+    df["logv_mean22"] = np.log(v.rolling(22).mean().clip(lower=1e-12))
     df["vol_surprise"] = v / v.rolling(W).median()
     df["skew66"] = ret.rolling(66).skew()
     df["kurt66"] = ret.rolling(66).kurt()
     if s["tier"] in ("OM", "BN"):
         df["jump_share22"] = s["jump_share"].rolling(22).mean()
-        df["log_bv"] = np.log(s["bv"].clip(lower=1e-12))
+        df["log_bv"] = np.log(s["bv"].clip(lower=1e-12)).rolling(22).mean()
     else:
         sd66 = ret.rolling(66).std()
         df["jump_share22"] = (ret.abs() > 3 * sd66).astype(float).rolling(22).mean()
@@ -471,7 +472,7 @@ def loss_predictions(panel: pd.DataFrame, groups: dict, h: int, first_test_year:
     sub["_date"] = pd.to_datetime(sub["date"])
     sub["_target_end"] = pd.to_datetime(sub["target_end"]) if "target_end" in sub.columns else pd.Series(pd.NaT, index=sub.index)
     all_cols = sorted(set(c for v in groups.values() for c in v))
-    rows = []
+    parts = []
     coefs = []
     dropped_fix4 = []
     for fold_year in sorted(y for y in sub["_date"].dt.year.unique() if y >= first_test_year):
@@ -513,13 +514,19 @@ def loss_predictions(panel: pd.DataFrame, groups: dict, h: int, first_test_year:
             if name == "M1" and learner == "ridge" and getattr(mdl, "pipe", None) is not None:
                 coef = mdl.pipe.named_steps["ridge"].coef_[:len(cols)]
                 coefs.append(pd.DataFrame({"feature": cols, "coef": coef, "fold": fold_year}))
-            for i, (_, r) in enumerate(test.iterrows()):
-                rows.append({"asset": r["asset"], "tier": r["tier"], "date": r["date"], "h": h, "fold": int(fold_year),
-                             "model": name, "learner": learner, "target": target, "prediction": float(pred[i]),
-                             "fixed_model": fixed_model, "variant": variant, "table": table, "item": item,
-                             "qlike": float(r["qlike"]), "log_ratio": float(r["log_ratio"]), "y_log": float(r["_y"]),
-                             "y_eval": float(r["_eval"]), "train_y_mean": float(train["_y"].mean())})
-    out = pd.DataFrame(rows)
+            # B4: vectorised assembly (no per-row iterrows).
+            n_te = len(test)
+            parts.append(pd.DataFrame({
+                "asset": test["asset"].to_numpy(), "tier": test["tier"].to_numpy(), "date": test["date"].to_numpy(),
+                "h": np.full(n_te, h), "fold": np.full(n_te, int(fold_year)), "model": np.full(n_te, name),
+                "learner": np.full(n_te, learner), "target": np.full(n_te, target), "prediction": np.asarray(pred, float),
+                "fixed_model": np.full(n_te, fixed_model), "variant": np.full(n_te, variant),
+                "table": np.full(n_te, table), "item": np.full(n_te, item),
+                "qlike": test["qlike"].to_numpy(dtype=float), "log_ratio": test["log_ratio"].to_numpy(dtype=float),
+                "y_log": test["_y"].to_numpy(dtype=float), "y_eval": test["_eval"].to_numpy(dtype=float),
+                "train_y_mean": np.full(n_te, float(train["_y"].mean())),
+            }))
+    out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["asset", "tier", "date", "h", "fold", "model", "learner", "target", "prediction", "fixed_model", "variant", "table", "item", "qlike", "log_ratio", "y_log", "y_eval", "train_y_mean"])
     out.attrs["coefs"] = pd.concat(coefs, ignore_index=True) if coefs else pd.DataFrame(columns=["feature", "coef", "fold"])
     out.attrs["dropped_fix4"] = pd.DataFrame(dropped_fix4, columns=["asset", "fold", "n_train", "n_test_dropped"])
     print(f"[fix4] total test rows dropped (<{smoke(250, 40)} train): {int(out.attrs['dropped_fix4']['n_test_dropped'].sum()) if dropped_fix4 else 0} across {len(dropped_fix4)} asset-folds")
@@ -536,6 +543,112 @@ def _delta_from_preds(preds: pd.DataFrame, m0="M0", m1="M1") -> dict:
             "spearman_M0": spearman(y, p[m0].to_numpy()), "spearman_M1": spearman(y, p[m1].to_numpy())}
 
 
+def _csr_date_groups(date_arr):
+    """CSR offsets for rows grouped by unique date (sorted); rows reordered by date."""
+    codes, uniq = pd.factorize(pd.to_datetime(date_arr), sort=True)
+    order = np.argsort(codes, kind="stable")
+    counts = np.bincount(codes, minlength=len(uniq)).astype(np.int64)
+    offsets = np.zeros(len(uniq) + 1, dtype=np.int64); np.cumsum(counts, out=offsets[1:])
+    return np.asarray(uniq), order, counts, offsets
+
+
+def _all_draw_date_idx(n_dates: int, block: int, rng, n_boot: int) -> np.ndarray:
+    """All date-block bootstrap draws at once: (n_boot, n_dates) unique-date indices.
+    Same sampling law as panel_date_bootstrap (block starts uniform, truncated to n_dates)."""
+    if n_dates == 0 or n_boot <= 0:
+        return np.empty((0, 0), dtype=np.int64)
+    block = max(1, int(block))
+    n_blocks = int(np.ceil(n_dates / block))
+    starts = rng.integers(0, max(1, n_dates - block + 1), size=(n_boot, n_blocks))
+    picked = (starts[:, :, None] + np.arange(block, dtype=np.int64)).reshape(n_boot, -1)[:, :n_dates]
+    return np.clip(picked, 0, n_dates - 1)
+
+
+def _row_idx_for_draw(offsets, counts, picked) -> np.ndarray:
+    """Expand picked unique-date indices to row indices via CSR offsets (vectorised)."""
+    reps = counts[picked]
+    total = int(reps.sum())
+    if total == 0:
+        return np.empty(0, dtype=np.int64)
+    within = np.arange(total, dtype=np.int64) - np.repeat(np.cumsum(reps) - reps, reps)
+    return np.repeat(offsets[picked], reps) + within
+
+
+def _threaded_deltas(fn, n_boot: int) -> np.ndarray:
+    workers = max(1, min(4, (os.cpu_count() or 1)))
+    if n_boot <= 0:
+        return np.empty(0)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        vals = list(ex.map(fn, range(n_boot)))
+    out = np.asarray(vals, dtype=float)
+    return out[np.isfinite(out)]
+
+
+def _boot_ci(base_delta: float, deltas: np.ndarray) -> dict:
+    if len(deltas) == 0 or not np.isfinite(base_delta):
+        return {"ci_low": np.nan, "ci_high": np.nan, "p": np.nan}
+    pval = float(2 * min(np.mean(deltas <= 0), np.mean(deltas >= 0))) if base_delta != 0 else 1.0
+    return {"ci_low": float(np.nanpercentile(deltas, 2.5)), "ci_high": float(np.nanpercentile(deltas, 97.5)),
+            "p": min(max(pval, 1.0 / (len(deltas) + 1)), 1.0)}
+
+
+def gw_companion(preds: pd.DataFrame, panel: pd.DataFrame, groups: dict, h: int = PRIMARY_H) -> dict:
+    """Plan GW companion: OOS M0 residual y_log-M0_pred on per-asset-standardised LRQA,
+    Driscoll-Kraay HAC (lags>=h, scores summed by date) + Wald test on LRQA coefficients."""
+    out = {"gw_stat": np.nan, "gw_p": np.nan, "gw_lags": np.nan, "gw_n": 0, "gw_n_dates": 0, "gw_k_lrqa": 0}
+    if not len(preds) or not len(panel):
+        return out
+    piv = preds.pivot_table(index=["asset", "date"], columns="model", values="prediction", aggfunc="first").dropna()
+    lrqa_cols = [c for c in groups.get("M1", []) if c.startswith("lrqa_")]
+    if "M0" not in piv or not lrqa_cols:
+        return out
+    base = panel[panel["h"] == h].drop_duplicates(["asset", "date"]).set_index(["asset", "date"])
+    common = piv.index.intersection(base.index)
+    if len(common) <= 50:
+        return out
+    yd = preds.drop_duplicates(["asset", "date"]).set_index(["asset", "date"]).loc[common, "y_log"].to_numpy(dtype=float)
+    resid = yd - piv.loc[common, "M0"].to_numpy(dtype=float)
+    zdf = base.loc[common, lrqa_cols].apply(pd.to_numeric, errors="coerce")
+    assets = np.array([a for a, _ in common]); dates = pd.to_datetime([d for _, d in common])
+    # Per-asset standardisation (mirrors loss-predictor scaling), NaN -> 0 after scaling.
+    zdf = zdf.copy(); zdf["_asset"] = assets
+    grp = zdf.groupby("_asset")[lrqa_cols]
+    z = ((zdf[lrqa_cols] - grp.transform("mean")) / grp.transform("std").replace(0, np.nan)).to_numpy(dtype=float)
+    z = np.where(np.isfinite(z), z, 0.0)
+    keep = np.array([np.std(z[:, j]) > 0 for j in range(z.shape[1])])
+    if not keep.any():
+        return out
+    z = z[:, keep]
+    ok = np.isfinite(resid)
+    if ok.sum() <= z.shape[1] + 10:
+        return out
+    resid, z, dates, assets = resid[ok], z[ok], dates[ok], assets[ok]
+    X = np.column_stack([np.ones(len(resid)), z])
+    beta, *_ = np.linalg.lstsq(X, resid, rcond=None)
+    e = resid - X @ beta
+    scores = X * e[:, None]
+    codes, uniq_dates = pd.factorize(dates, sort=True)
+    S = np.zeros((len(uniq_dates), X.shape[1])); np.add.at(S, codes, scores)
+    T = len(uniq_dates)
+    lags = int(max(int(h), np.floor(4 * (T / 100) ** (2 / 9)) if T > 0 else int(h)))
+    meat = S.T @ S
+    for j in range(1, lags + 1):
+        if j >= T:
+            break
+        w = 1 - j / (lags + 1)
+        gj = S[j:].T @ S[:-j]
+        meat += w * (gj + gj.T)
+    try:
+        bread = np.linalg.pinv(X.T @ X)
+        vcov = bread @ meat @ bread; vcov = 0.5 * (vcov + vcov.T)
+        sub = vcov[1:, 1:]; bsub = beta[1:]
+        wald = float(bsub @ np.linalg.pinv(sub) @ bsub)
+        pval = float(stats.chi2.sf(wald, df=len(bsub))) if np.isfinite(wald) else np.nan
+    except Exception:
+        return out
+    return {"gw_stat": wald, "gw_p": pval, "gw_lags": lags, "gw_n": int(len(resid)), "gw_n_dates": int(T), "gw_k_lrqa": int(z.shape[1])}
+
+
 def delta_bootstrap(preds: pd.DataFrame, n_boot: int, rng, m0="M0", m1="M1", block=22) -> dict:
     base = _delta_from_preds(preds, m0, m1)
     if not np.isfinite(base.get("delta", np.nan)):
@@ -545,25 +658,20 @@ def delta_bootstrap(preds: pd.DataFrame, n_boot: int, rng, m0="M0", m1="M1", blo
     y = dates.loc[p.index, "y_eval"].to_numpy()
     a0, a1 = p[m0].to_numpy(), p[m1].to_numpy()
     date_arr = pd.to_datetime([d for _, d in p.index])
-    uniq_dates = pd.Index(date_arr).unique()
-    pos_by_date = {d: np.where(date_arr == d)[0] for d in uniq_dates}
-    deltas = []
-    for _ in range(n_boot):
-        picked = panel_date_bootstrap(date_arr, block, rng)
-        idx = np.concatenate([pos_by_date[d] for d in picked]) if len(picked) else np.array([], dtype=int)
-        if len(idx) < 20:
-            continue
-        deltas.append(spearman(y[idx], a1[idx]) - spearman(y[idx], a0[idx]))
-    deltas = np.asarray(deltas)
+    uniq, order, counts, offsets = _csr_date_groups(date_arr)
+    y, a0, a1 = y[order], a0[order], a1[order]
+    picked_all = _all_draw_date_idx(len(uniq), block, rng, int(n_boot))
+    def _one(d):
+        idx = _row_idx_for_draw(offsets, counts, picked_all[d])
+        return spearman(y[idx], a1[idx]) - spearman(y[idx], a0[idx]) if len(idx) >= 20 else np.nan
+    deltas = _threaded_deltas(_one, int(n_boot))
     if len(deltas) == 0:
         return {**base, "ci_low": np.nan, "ci_high": np.nan, "p": np.nan}
-    pval = float(2 * min(np.mean(deltas <= 0), np.mean(deltas >= 0))) if base["delta"] != 0 else 1.0
-    return {**base, "ci_low": float(np.nanpercentile(deltas, 2.5)), "ci_high": float(np.nanpercentile(deltas, 97.5)),
-            "p": min(max(pval, 1.0 / (len(deltas) + 1)), 1.0), "boot_deltas": deltas}
+    return {**base, **_boot_ci(base["delta"], deltas), "boot_deltas": deltas}
 
 
 def auc_delta_bootstrap(preds: pd.DataFrame, thr_by_asset, n_boot: int, rng, block=22) -> dict:
-    """Date-block bootstrap for M1-M0 event AUC (event = qlike > train 90th pct)."""
+    """Date-block bootstrap for M1-M0 event AUC (event = qlike > train 90th pct). CSR + threaded."""
     from sklearn.metrics import roc_auc_score
     p = preds.pivot_table(index=["asset", "date"], columns="model", values="prediction", aggfunc="first").dropna()
     qdf = preds.drop_duplicates(["asset", "date"]).set_index(["asset", "date"])
@@ -580,20 +688,18 @@ def auc_delta_bootstrap(preds: pd.DataFrame, thr_by_asset, n_boot: int, rng, blo
     a0, a1 = p["M0"].to_numpy(), p["M1"].to_numpy()
     base = float(roc_auc_score(ev, a1) - roc_auc_score(ev, a0))
     date_arr = pd.to_datetime([d for _, d in p.index])
-    pos_by_date = {d: np.where(date_arr == d)[0] for d in pd.Index(date_arr).unique()}
-    deltas = []
-    for _ in range(n_boot):
-        picked = panel_date_bootstrap(date_arr, block, rng)
-        idx = np.concatenate([pos_by_date[d] for d in picked]) if len(picked) else np.array([], dtype=int)
+    uniq, order, counts, offsets = _csr_date_groups(date_arr)
+    ev, a0, a1 = ev[order], a0[order], a1[order]
+    picked_all = _all_draw_date_idx(len(uniq), block, rng, int(n_boot))
+    def _one(d):
+        idx = _row_idx_for_draw(offsets, counts, picked_all[d])
         if len(idx) < 20 or len(np.unique(ev[idx])) < 2:
-            continue
-        deltas.append(float(roc_auc_score(ev[idx], a1[idx]) - roc_auc_score(ev[idx], a0[idx])))
-    deltas = np.asarray(deltas)
+            return np.nan
+        return float(roc_auc_score(ev[idx], a1[idx]) - roc_auc_score(ev[idx], a0[idx]))
+    deltas = _threaded_deltas(_one, int(n_boot))
     if len(deltas) == 0:
         return {"delta": base, "ci_low": np.nan, "ci_high": np.nan, "p": np.nan, "n": len(p)}
-    pval = float(2 * min(np.mean(deltas <= 0), np.mean(deltas >= 0))) if base != 0 else 1.0
-    return {"delta": base, "ci_low": float(np.nanpercentile(deltas, 2.5)), "ci_high": float(np.nanpercentile(deltas, 97.5)),
-            "p": min(max(pval, 1.0 / (len(deltas) + 1)), 1.0), "n": len(p)}
+    return {"delta": base, **_boot_ci(base, deltas), "n": len(p)}
 
 
 # ---------------------------------------------------------------- panel building
@@ -739,28 +845,16 @@ def run_pipeline(spec: dict, out_dir: Path, fig_dir: Path, cache_exp: str, data:
             ss_res = float(((pp["y_log"] - pp["prediction"]) ** 2).sum())
             ss_tot = float(((pp["y_log"] - pp["train_y_mean"]) ** 2).sum())
             r2[mname] = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
-    # GW descriptive: squared-error loss differential, RQA instruments
-    gw_stat, gw_p = (np.nan, np.nan)
-    if len(preds_primary):
-        piv = preds_primary.pivot_table(index=["asset", "date"], columns="model", values="prediction", aggfunc="first").dropna()
-        lrqa_cols = [c for c in groups_om.get("M1", []) if c.startswith("lrqa_")]
-        base = panel_om[panel_om["h"] == PRIMARY_H].drop_duplicates(["asset", "date"]).set_index(["asset", "date"])
-        common = piv.index.intersection(base.index)
-        if len(common) > 50 and lrqa_cols:
-            yd = preds_primary.drop_duplicates(["asset", "date"]).set_index(["asset", "date"]).loc[common, "y_log"].to_numpy()
-            l0 = (yd - piv.loc[common, "M0"].to_numpy()) ** 2; l1 = (yd - piv.loc[common, "M1"].to_numpy()) ** 2
-            Z = base.loc[common, lrqa_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy()
-            try:
-                gw_stat, gw_p = giacomini_white(l0, l1, Z, h=PRIMARY_H)
-            except Exception:
-                pass
+    # A1 GW companion (plan): OOS M0 residual on standardised LRQA, Driscoll-Kraay HAC lags>=h, Wald.
+    gw = gw_companion(preds_primary, panel_om, groups_om, h=PRIMARY_H) if len(preds_primary) else {"gw_stat": np.nan, "gw_p": np.nan, "gw_lags": np.nan, "gw_n": 0, "gw_n_dates": 0, "gw_k_lrqa": 0}
+    gw_stat, gw_p = gw["gw_stat"], gw["gw_p"]
     g2_pass = bool(np.isfinite(boot.get("delta", np.nan)) and boot["delta"] > 0 and np.isfinite(boot.get("ci_low", np.nan)) and boot["ci_low"] > 0 and np.isfinite(share_pos) and share_pos >= 0.60)
     primary_row = {"tier": "OM", "h": PRIMARY_H, "fixed_model": "LogHAR", "learner": "ridge", "comparison": "M1_vs_M0",
                    "delta_spearman": boot.get("delta"), "ci_low": boot.get("ci_low"), "ci_high": boot.get("ci_high"),
                    "p_bootstrap": boot.get("p"), "n": boot.get("n"), "share_assets_positive": share_pos,
                    "oos_r2_M0": r2.get("M0"), "oos_r2_M1": r2.get("M1"),
                    "oos_r2_delta": (r2.get("M1", np.nan) - r2.get("M0", np.nan)) if r2 else np.nan,
-                   "gw_stat": gw_stat, "gw_p": gw_p, "gate_G2": "pass" if g2_pass else "fail", "smoke": smoke_mode,
+                   "gw_stat": gw_stat, "gw_p": gw_p, "gw_method": "M0-residual on per-asset-standardised LRQA; Driscoll-Kraay HAC lags>=h; Wald on LRQA", "gw_lags": gw.get("gw_lags"), "gw_n": gw.get("gw_n"), "gw_n_dates": gw.get("gw_n_dates"), "gw_k_lrqa": gw.get("gw_k_lrqa"), "gate_G2": "pass" if g2_pass else "fail", "smoke": smoke_mode,
                    "flag_2020_partial": "2020 test year is Jan-Feb only (OM ends 2020-02-21)"}
     report.save_table(pd.DataFrame([primary_row]), out_dir, "results_primary")
     report.save_table(per_asset, out_dir, "per_asset")
@@ -836,8 +930,18 @@ def run_pipeline(spec: dict, out_dir: Path, fig_dir: Path, cache_exp: str, data:
             cols = [c for c in panel_om.columns if c.startswith(f"geom_{arm}_")]
             if cols:
                 geom_cols[arm] = cols
-                garm = {"M0": groups_om["M0"], "M1": groups_om["M0"] + cols}
-                add_sec("geometry", f"GEOM_{arm}", loss_predictions(panel_om, garm, PRIMARY_H, fy["OM"], table="geometry", item=f"GEOM_{arm}"))
+                # B4: reuse identical M0 from preds_primary; fit only the arm's M1.
+                garm = {"M1": groups_om["M0"] + cols}
+                arm_m1 = loss_predictions(panel_om, garm, PRIMARY_H, fy["OM"], table="geometry", item=f"GEOM_{arm}")
+                m0_reuse = preds_primary[preds_primary["model"] == "M0"].copy() if len(preds_primary) else pd.DataFrame()
+                if len(m0_reuse) and len(arm_m1):
+                    m0_reuse.attrs = {}; arm_m1.attrs = {}
+                    arm_preds = pd.concat([m0_reuse, arm_m1], ignore_index=True)
+                elif len(arm_m1):
+                    arm_preds = loss_predictions(panel_om, {"M0": groups_om["M0"], **garm}, PRIMARY_H, fy["OM"], table="geometry", item=f"GEOM_{arm}")
+                else:
+                    arm_preds = arm_m1
+                add_sec("geometry", f"GEOM_{arm}", arm_preds)
     # Tier A + overlap + out-of-period; Tier BN
     preds_a = loss_predictions(panel_a, groups_a, PRIMARY_H, fy["A"], table="tiers", item="TierA_M1") if len(panel_a) else pd.DataFrame()
     add_sec("tiers", "TierA_M1", preds_a, tier="A", append=False)

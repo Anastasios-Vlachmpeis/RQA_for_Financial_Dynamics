@@ -135,12 +135,13 @@ def build_initial_spec(smoke_mode: bool) -> dict:
     segs_s1 = segment_lengths(smoke_mode, "S1")
     spec = {
         "experiment": "E2",
-        "version": 4,
+        "version": 5,
         "changelog": [
             "feature backend numpy → torch; RPs identical by parity test",
             "record torch dtype float64; persist rp_fallback_arms",
             "M1 trained on same rows as M0 (NaN-imputed, not dropped); bootstrap stat aligned",
             "gz secondary arm: global z-score with eps_train fit on the library segment (keeps level)",
+            "v5: secondary p-values two-sided from bootstrap SE (z=delta/std(boots, ddof=1), p=2*norm.sf(|z|)); percentile CI kept; primary gate rule unchanged; per-cell predictions saved as .npz",
         ],
         "backend": "torch",
         "torch_dtype": "float64",
@@ -181,6 +182,12 @@ def build_initial_spec(smoke_mode: bool) -> dict:
             "lag_bin": "[25,50)",
             "lag_rule": "M1b AUC not below M0 by >0.02 in lag bin",
             "block_steps": 50,
+        },
+        "bootstrap": {
+            "n_boot": smoke(400, 60),
+            "secondary_p_value": "two-sided normal approximation from bootstrap SE: z=delta/std(boots, ddof=1), p=2*norm.sf(|z|)",
+            "ci": "percentile [2.5, 97.5] of bootstrap deltas",
+            "primary_gate_rule": "unchanged: delta>0.02 and ci_low>0 (p-value not used)",
         },
         "gate_E2": "primary_test pass_rule",
         "gate_G1": "E1_pass OR E2_pass",
@@ -959,8 +966,16 @@ def pooled_delta_ci(
     boots_a = boots_a[np.isfinite(boots_a)]
     if len(boots_a):
         lo, hi = np.percentile(boots_a, [2.5, 97.5])
-        # One-sided p for a positive gain: share of bootstrap draws that are not positive.
-        p_value = float((1 + np.sum(boots_a <= 0.0)) / (len(boots_a) + 1))
+        # Two-sided p from the bootstrap SE (percentile CI above is kept as-is).
+        # The primary gate does not use this p-value (delta_pass below is unchanged).
+        if len(boots_a) > 1 and np.isfinite(delta):
+            se = float(np.std(boots_a, ddof=1))
+            if se > 0:
+                p_value = float(2.0 * stats.norm.sf(abs(float(delta) / se)))
+            else:
+                p_value = 0.0 if float(delta) != 0.0 else 1.0
+        else:
+            p_value = np.nan
     else:
         lo = hi = p_value = np.nan
     return {
@@ -1124,10 +1139,12 @@ def build_decision_table(
             "verdict": "pass" if e2_pass else "fail",
         }
     )
-    if e1_pass is None:
+    if e2_pass:
+        g1_value, g1_verdict = True, "pass"
+    elif e1_pass is None:
         g1_value, g1_verdict = np.nan, "pending"
     else:
-        g1_value = bool(e2_pass or e1_pass)
+        g1_value = bool(e1_pass)
         g1_verdict = "pass" if g1_value else "fail"
     rows.append(
         {
@@ -1138,7 +1155,7 @@ def build_decision_table(
             "value": g1_value,
             "ci_low": np.nan,
             "ci_high": np.nan,
-            "rule": "full E1 decision OR E2; pending if that E1 file is absent",
+            "rule": "E1_pass OR E2_pass; pending only if E2 fails and full E1 decision is absent",
             "verdict": g1_verdict,
         }
     )
@@ -1507,6 +1524,25 @@ def _holm_secondary_table(rows: list[dict], family: str) -> pd.DataFrame:
     df["holm_p"] = adj
     df["exploratory"] = True
     return df
+
+def _save_cell_predictions(out_dir, name: str, seeds, p0_list, p1_list, y_list) -> Path:
+    """Save one cell's per-seed predictions so statistics can be recomputed without refitting."""
+    pred_dir = Path(out_dir) / "predictions"
+    pred_dir.mkdir(parents=True, exist_ok=True)
+    arrays: dict[str, np.ndarray] = {
+        "seeds": np.asarray([int(s) for s in seeds], dtype=int),
+        "p0": np.concatenate([np.asarray(a, float) for a in p0_list]) if p0_list else np.empty(0),
+        "p1": np.concatenate([np.asarray(a, float) for a in p1_list]) if p1_list else np.empty(0),
+        "y": np.concatenate([np.asarray(a, float) for a in y_list]) if y_list else np.empty(0),
+    }
+    for i, (p0, p1, y) in enumerate(zip(p0_list, p1_list, y_list)):
+        arrays[f"p0_{i}"] = np.asarray(p0, float)
+        arrays[f"p1_{i}"] = np.asarray(p1, float)
+        arrays[f"y_{i}"] = np.asarray(y, float)
+    path = pred_dir / f"{name}.npz"
+    np.savez_compressed(path, **arrays)
+    return path
+
 
 
 def _geom_payload(g: Geometry) -> dict:
@@ -1950,9 +1986,20 @@ def run_primary_and_outputs(
                     "p0": [pp["preds"][f"M0|{predictor}"] for pp in pred_packs],
                     "p1": [pp["preds"][f"{model}|{predictor}"] for pp in pred_packs],
                     "y": [pp["y"] for pp in pred_packs],
+                    "seeds": [int(pp["seed"]) for pp in pred_packs],
                     "boot_seed": _boot_seed("sec", system, W, h, gname, model, predictor),
                 }
             )
+
+    for job in ci_jobs:
+        _save_cell_predictions(
+            out_dir,
+            f"{job['system']}_W{job['W']}_h{job['h']}_{job['geometry']}_{job['model']}_{job['predictor']}",
+            job["seeds"],
+            job["p0"],
+            job["p1"],
+            job["y"],
+        )
 
     def _ci_one(job: dict) -> dict:
         stats_d = pooled_delta_ci(
@@ -2003,6 +2050,15 @@ def run_primary_and_outputs(
         n_boot=n_boot,
         n_jobs=12,
     )
+    if packs:
+        _save_cell_predictions(
+            out_dir,
+            f"primary_S1_W{W_primary}_h{h_primary}_wz_M1b_ridge",
+            [int(packs[i]["seed"]) for i in order],
+            p0_all,
+            p1_all,
+            y_all,
+        )
     if lag_rows:
         lag_df = pd.DataFrame(lag_rows)
         sub_bin = lag_df.loc[

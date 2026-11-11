@@ -20,7 +20,24 @@ def add_obs_noise(log_price, omega, rng):
     return x + rng.normal(0, omega, size=len(x))
 
 
+def _block_mask(n, n_target, block_len, rng):
+    """Non-overlapping blocks of ``block_len`` at uniformly random offsets, about ``n_target`` points in total."""
+    block_len = max(1, int(block_len))
+    nb = max(1, int(round(n_target / block_len)))
+    nb = min(nb, n // block_len)
+    out = np.zeros(n, dtype=bool)
+    if nb <= 0:
+        return out
+    free = n - nb * block_len
+    slots = np.sort(rng.choice(free + nb, size=nb, replace=False))
+    for k, p in enumerate(slots):
+        start = int(p) + k * (block_len - 1)
+        out[start : start + block_len] = True
+    return out
+
+
 def mask_missing(x, frac, mode="random", block_len=10, rng=None):
+    """Return (x with NaN, observed mask). ``mode="block"``: gaps of ``block_len`` totalling ``frac``."""
     if rng is None:
         raise TypeError("rng required")
     x = np.asarray(x, float).copy()
@@ -31,16 +48,14 @@ def mask_missing(x, frac, mode="random", block_len=10, rng=None):
     if mode == "random":
         idx = rng.choice(len(x), size=n_miss, replace=False)
         mask[idx] = False
-        x[idx] = np.nan
     else:
-        start = rng.integers(0, max(1, len(x) - block_len))
-        end = min(len(x), start + max(block_len, n_miss))
-        mask[start:end] = False
-        x[start:end] = np.nan
+        mask[_block_mask(len(x), n_miss, block_len, rng)] = False
+    x[~mask] = np.nan
     return x, mask
 
 
 def make_stale(x, frac, mode, rng, block_len=10):
+    """Stale indices repeat the last fresh value. ``mode="block"``: runs of ``block_len`` totalling ``frac``."""
     x = np.asarray(x, float).copy()
     n = len(x)
     n_stale = int(frac * n)
@@ -49,9 +64,7 @@ def make_stale(x, frac, mode, rng, block_len=10):
         if mode == "random":
             stale[rng.choice(n, size=n_stale, replace=False)] = True
         else:
-            start = rng.integers(0, max(1, n - block_len))
-            end = min(n, start + max(block_len, n_stale))
-            stale[start:end] = True
+            stale = _block_mask(n, n_stale, block_len, rng)
     last = x[0]
     out = x.copy()
     for i in range(n):

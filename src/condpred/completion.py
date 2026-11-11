@@ -35,15 +35,15 @@ def _hankel(x, m, tau):
 
 
 def _anti_diag_avg(H):
+    """Replace every entry by the mean of its anti-diagonal (Hankel projection), NaN entries ignored."""
     m, n = H.shape
-    out = np.zeros_like(H)
-    for s in range(m + n - 1):
-        diag = [H[i, s - i] for i in range(max(0, s - n + 1), min(m, s + 1))]
-        if diag:
-            v = float(np.nanmean(diag))
-            for i in range(max(0, s - n + 1), min(m, s + 1)):
-                out[i, s - i] = v
-    return out
+    s = (np.arange(m)[:, None] + np.arange(n)[None, :]).ravel()
+    vals = H.ravel()
+    ok = np.isfinite(vals)
+    sums = np.bincount(s[ok], weights=vals[ok], minlength=m + n - 1)
+    counts = np.bincount(s[ok], minlength=m + n - 1)
+    means = np.divide(sums, counts, out=np.full(m + n - 1, np.nan), where=counts > 0)
+    return means[s].reshape(m, n)
 
 
 def hankel_complete(x, m, tau=1, rank=None, n_iter=200, tol=1e-6):
