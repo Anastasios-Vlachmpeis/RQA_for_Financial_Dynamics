@@ -29,7 +29,7 @@ def run_all(rng=None) -> list[tuple[str, bool, str]]:
     results.append(_check_power_ctrl())
     results.append(_check_beta_pos())
     results.append(_check_hankel())
-    results.append(_check_perc_corner(rng))
+    results.append(_check_perc_span(rng))
     results.append(_check_loghar_call_order(rng))
     results.append(_check_hac())
     results.append(_check_panel_bootstrap(rng))
@@ -136,16 +136,11 @@ def _check_hankel():
     return ("hankel_complete", err < 1e-3, f"miss_rel_err={err:.2e}")
 
 
-def _check_perc_corner(rng):
+def _check_perc_span(rng):
     n = 40
     D = np.full((n, n), 50.0)
     np.fill_diagonal(D, 0.0)
     D[0, n - 1] = D[n - 1, 0] = 0.01
-    I, J = np.triu_indices(n, 1)
-    D[I, J] = 50.0
-    D[J, I] = 50.0
-    D[0, n - 1] = D[n - 1, 0] = 0.01
-    rc = percolation.rho_perc_corner(D, theiler=1, delta=0.05)
     rs = percolation.rho_perc_span(D, theiler=1, delta=0.05)
     spans = []
     for _ in range(5):
@@ -156,11 +151,11 @@ def _check_perc_corner(rng):
     spans = np.asarray(spans, float)
     span_std = float(np.std(spans))
     ok_var = span_std > 0.01 and not np.all(np.isclose(spans, 1.0, atol=1e-3))
-    ok = rc < 0.05 and rs > 0.2 and ok_var and np.all(np.isfinite(spans))
+    ok = rs > 0.2 and ok_var and np.all(np.isfinite(spans))
     return (
-        "perc_corner",
+        "perc_span_rejects_corner",
         ok,
-        f"corner={rc:.4f} span_flaw={rs:.4f} span_std={span_std:.4f} spans={spans.round(4).tolist()}",
+        f"span={rs:.4f} span_std={span_std:.4f} spans={spans.round(4).tolist()}",
     )
 
 
@@ -497,10 +492,7 @@ def run_leakage_suite(x, rng):
     def perc_fn(arr, t):
         win = arr[max(0, t - W + 1) : t + 1]
         D = euclidean_distances(embed(window_z(win), m, tau))
-        return {
-            "corner": percolation.rho_perc_corner(D, 1, 0.05),
-            "span": percolation.rho_perc_span(D, 1, 0.05),
-        }
+        return {"span": percolation.rho_perc_span(D, 1, 0.05)}
 
     _add("PERC", perc_fn)
 

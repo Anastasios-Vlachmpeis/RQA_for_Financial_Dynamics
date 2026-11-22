@@ -81,9 +81,9 @@ RecPlay/
 | `embedding` | `embed`: time-delay embedding; `average_mutual_information`, `first_local_minimum` and `false_nearest_fraction` to choose τ and m |
 | `recurrence` | distance matrices, symmetric β-divergence (any real β), ε set by a target recurrence rate (`threshold_by_rate`), single and joint recurrence matrices |
 | `rqa` | diagonal/vertical line lengths, `rqa` measures, `k2_lines` |
-| `connectivity` | `rr_critical`: RRc, the RR at which an 8-connected recurrence cluster first links the first δN rows to the last δN columns (union–find); `omega_ranks` for joint RPs |
+| `connectivity` | `omega_ranks` for joint RPs |
 | `surrogates` | `iaaft` surrogates |
-| `windowed` | sliding-window RQA (plus the current state's recurrence rate, `RR_last`; windows every `step` rows) and RRc (with IAAFT-surrogate null) feature frames; Euclidean on z or exp(z), or β-divergence distance |
+| `windowed` | sliding-window RQA and current-state recurrence rate (`RR_last`); Euclidean on z or exp(z), or β-divergence distance |
 | `analogue` | `analogue_frame`: the current state's recurrences with the whole past and the share of them followed by a rise h months later |
 | `dependence` | independence ratios and joint covariance/correlation for pairs and triples |
 | `torp` | `cross_distances` between two state arrays; `perimeter_tensor` (sum of pairwise dissimilarities of three state arrays, any `distance`; a = b = c gives the single-series TORP); `threshold_tensor_by_rate`; `whitening_matrix` (Mahalanobis via Σ^(-1/2)); `same_time_stats` (same-time diagonal vs whole tensor) |
@@ -115,6 +115,8 @@ Dedicated JEPA tasks, training and probes live under [Experimental exploration](
 | `results/tables/det_predictability_results.csv` | `DETPredictability` |
 | `results/tables/det_predictability_window_sweep.csv` | `DETPredictability` |
 | `results/tables/stock_trend_repro/{full,smoke}/<run hash>/` | `Stock_trend_RQA_transposed_transformer`: predictions, seed/stock summaries, published-reference comparisons, ablations, coverage, manifest and diagnostic figures; full-mode `missing_data.csv` lists unavailable source ranges |
+
+The original corner-based RRc could count a single corner pixel as a connection from start to finish. Its PDF and implementation were retired, along with the P0 runner that compared it against other definitions. The saved P0 results remain historical evidence; the separate cover-rule implementation and its negative added-value result are unaffected.
 
 ## References
 

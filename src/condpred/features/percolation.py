@@ -4,12 +4,6 @@ from __future__ import annotations
 import numpy as np
 from math import ceil
 
-from recplay.connectivity import rr_critical
-
-
-def rho_perc_corner(D, theiler=1, delta=0.05) -> float:
-    return rr_critical(D, theiler=theiler, delta=delta)
-
 
 def rho_perc_span(D, theiler=1, delta=0.05) -> float:
     """Early–early to late–late span (fresh union–find, not recplay)."""
