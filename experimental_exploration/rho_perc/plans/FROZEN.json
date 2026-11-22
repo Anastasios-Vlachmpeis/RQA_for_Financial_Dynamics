@@ -1,0 +1,7 @@
+{
+  "core_py_sha256": "3ad7c180046f5df92ddf635ebe638adceeb8d0605428cb8d1b22fc224013c636",
+  "file": "src/rhoperc/core.py",
+  "gate": "G0",
+  "frozen_at": "2026-11-14",
+  "note": "Frozen after selfcheck K1-K9 PASS (see notebooks/tables/rho_perc/P0/decision.csv)"
+}

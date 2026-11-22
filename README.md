@@ -34,40 +34,25 @@ Its implementation is split into classes in the sibling
 `Reporter` and `ReproductionChecks`. The notebook contains imports and orchestration;
 restart its kernel after editing the modules. Cache identities include module sources.
 
-The `05_jepa` notebooks need their own environment `.venv-jepa` (Python 3.12, CUDA PyTorch; Jupyter
-kernel **RQA JEPA (.venv-jepa)**, name `rqa-jepa`):
+See [Experimental exploration](experimental_exploration/) for JEPA setup and the archived experiment
+findings, notebooks, and run commands.
 
-```
-python -m venv .venv-jepa
-.venv-jepa/Scripts/python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu128
-.venv-jepa/Scripts/python.exe -m pip install numpy scipy pandas scikit-learn matplotlib ipykernel nbformat
-.venv-jepa/Scripts/python.exe -m ipykernel install --user --name rqa-jepa --display-name "RQA JEPA (.venv-jepa)"
-```
 
-Their full runs take hours, so they are run unattended as scripts with
-`.venv-jepa/Scripts/python.exe notebooks/05_jepa/run_notebook.py <notebook> <figure folder>`. This executes
-the code cells without writing outputs into the notebook and saves figures as PNG files. Every training run
-is cached, so an interrupted run resumes where it stopped. `JEPA_SMOKE=1` runs a tiny version that writes
-to separate `smoke/` folders.
-
-Run every notebook from its own folder (Jupyter and PyCharm do this by default). Paths to `data/` and
-`results/` are relative to the notebook, e.g. `../../data/raw/fred`.
+Run notebooks from their own folders. Shared raw data lives under `data/raw/`.
 
 ## Layout
 
 ```
 RecPlay/
-├── src/recplay/          shared RP / RQA code (imported by the 02_macro screening notebooks)
-├── src/rpjepa/           synthetic tasks, RP encoders and JEPA pretraining (imported by 05_jepa)
-├── dashboard/            static HTML dashboards; `torp_triplets.html` (built by `06_torp/triplet_dashboard.py`)
+├── src/recplay/          shared RP / RQA code
+├── src/rpjepa/           shared neural encoders
+├── experimental_exploration/  JEPA pretraining, TORPs, rho_perc and CPI direction
 ├── notebooks/
 │   ├── 00_foundations/     exercises and first experiments
 │   ├── 01_reproductions/   reproductions of published results
 │   ├── 02_macro/           US macro series
 │   ├── 03_equity_indices/  stock indices and RP computation benchmarks
-│   ├── 04_predictability/  RQA measures as predictability gauges
-│   ├── 05_jepa/            JEPA self-supervised learning on recurrence plots (synthetic)
-│   └── 06_torp/            third-order recurrence across three financial series
+│   └── 04_predictability/  RQA measures as predictability gauges
 ├── data/raw/             source data, not tracked in git
 ├── data/processed/       notebook caches, not tracked in git
 └── results/tables/       tables written by notebooks
@@ -84,26 +69,10 @@ RecPlay/
 | 01 | `EucRPRepro` | Reproduction of Arratia & Sepúlveda: Euclidean RPs + CNN for the sign of the S&P 500 equity premium | Goyal–Welch 2025 |
 | 01 | `Stock_trend_RQA_transposed_transformer` | Su et al. (2025): 13 RQA features + variable-token Transformer, all six named baselines, branch removals and six RQA-input arms; chronological selection/refit and paper comparison tables | Tushare Pro, seven A-share stocks, 1-minute OHLCV, 2018–2022; token/permissions required |
 | 02 | `CPI_UNRATE_FEDFUNDS_RR` | Inflation, unemployment and fed funds rate, 1954–2026: individual, pairwise and triple joint RPs; independence ratios, Theiler window, joint covariance/correlation; β-divergence RPs | FRED |
-| 02 | `CPI_direction_RP_screening` | Which Euclidean sliding-window RP parameter (W, m, τ, target RR, input series) matters for predicting next month's YoY-inflation direction: RQA + RRc features, LightGBM with yearly expanding windows, variance decomposition and meta-model on 1975–1999, one final test on 2000–2026; descriptive RP of the monthly (DET, LAM, ENTR, RRc) vectors next to the RP of inflation states | FRED |
-| 02 | `CPI_direction_betaRP_screening` | Same screening with symmetric β-divergence RPs of exp(z) window states, β ∈ {−5, −2, −1, −0.5, 0.5, 1, 2, 5} as an extra factor | FRED |
-| 02 | `CPI_direction_monthlyRP_horizons` | Direction of YoY inflation 1, 3, 6 and 12 months ahead: lag model with monthly inflation and the explicit base effect vs the same plus RP features of monthly inflation (window RQA, current-state RR, RRc, window mean/std, analogue forecasts); screening 1975–1999, one final test on 2000–2026 | FRED |
-| 02 | `CPI_direction_betaRP_refinement` | β-divergence RPs of monthly inflation (W = 120, m = 2, τ = 1, rr = 0.05) for the same horizons: coarse-to-fine β search to depth 3 per horizon (8 β, then 8 β between the best and its better neighbour, twice) on 1975–1999, against Euclidean on z and on exp(z) and a β-profile model; every tried β scored once on 2000–2026 | FRED |
-| 02 | `CPI_direction_embedding_sweep` | h = 6 and 12: ablation of the window mean/std vs RQA/RRc features; embedding (m, τ) chosen from 1954–1999 monthly inflation by AMI and false nearest neighbours; sweep of embedding span (1–24 months) for Euclidean on z and on exp(z), the best of 8 β and a β-profile model, each scored against lags+base+mean/std on 1975–1999 and 2000–2026 | FRED |
-| 02 | `CPI_direction_crosscountry` | Pre-registered confirmation: reference (inflation lags, base effect, base-effect rule) vs reference + RQA/RRc of seasonally adjusted monthly inflation (W = 120, m = 2, τ = 1), h = 12 primary and h = 6, walk-forward from 1990 in 24 OECD countries plus the US; pooled AUC gain with a year-block bootstrap. Result: not confirmed (h = 12 pooled gain −0.033, 95% −0.059 to −0.008) | FRED (OECD MEI CPI) |
 | 03 | `RUT_SP500_NDX_RR` | Monthly log-return recurrences of the Russell 2000, S&P 500 and Nasdaq-100 | Yahoo, `^RUT` `^GSPC` `^NDX` |
 | 03 | `NDX_2025_5min_RP_benchmark` | Sliding-window RP compute time, Euclidean vs β-divergence (β = 1, 3, 7), calendar year 2025 | 5-min `^NDX` from a local CSV (not supplied) |
 | 03 | `NDX_60d_5min_RP_benchmark` | Same benchmark on the last 60 days available from Yahoo | Yahoo, 5-min `^NDX` |
 | 04 | `DETPredictability` | Whether DET combined with a second RQA measure tracks the actual predictability of chaotic and stochastic systems | synthetic (logistic map, Lorenz-63, …) |
-| 05 | `01_synthetic_benchmark` | Six synthetic tasks (system type of 11 classes incl. phase-randomised surrogates, Lyapunov exponent, noise level, change point, associative recall, 3-step forecast); baselines: trivial, RQA features + linear / gradient boosting, nearest-key and analogue references, frozen random-init encoders + linear probe, supervised training of 8 encoders (raw attention / conv / Hyena, RP + CNN / S4ND / ViT, exact and Taylor recurrence attention) | synthetic |
-| 05 | `02_rp_vs_attention` | Pre-registered test of whether a precomputed RP lets a local CNN do associative recall as well as attention (Zoology-style): sweeps of width, window length and number of key–value pairs, input ablation (D only, D + series, thresholded RPs), other tasks. Result: supported (recall R² 0.998 RP + CNN vs 0.763 attention vs 0.006 conv at d = 32), at ~140× the FLOPs per window at equal width | synthetic |
-| 05 | `03_jepa_probes` | JEPA pretraining (future-state masking, EMA target) of every encoder on 120,000 unlabeled windows, frozen linear probes vs TS-JEPA, MAE, random init and RQA features; mask, input and position ablations; learned recurrence-attention kernel. Result: RP-JEPA best (mean probe 0.524 vs 0.477 TS-JEPA) but only +0.011 over the same encoder untrained | synthetic |
-| 05 | `04_torp_multiscale` | Third-order RPs (Boussé et al. 2023): exact check that a perimeter TORP is a function of D while generalised cosine is not; supervised `sign` (x vs −x) and `direction` (forward vs reversed) diagnostics for D, cosine, perimeter / gencos TORPs (3D CNN and 3D S4ND), RQA features and raw attention; coarse-to-fine multiscale JEPA targets over recurrence rates vs single-scale. Result: only odd-order gencos TORPs beat chance on `sign` (0.88–0.89 on 2 of 3 seeds; D, cosine, perimeter TORP and RQA exactly 0.50), raw series solves it at 0.998; multiscale targets no gain (0.504 vs 0.510) | synthetic |
-| 05 | `05_nearest_pattern_rule` | Recall: hand-written nearest-pattern and soft (distance-weighted) retrieval rules vs RP + CNN and attention on the same splits, over window length, number of pairs and query noise. Result: the nearest rule solves every noise-free setting (R² ≥ 0.999, ~540 FLOPs per window); with a noisy query RP + CNN matches the soft rule (0.611 vs 0.605 at noise 0.25) but never beats the best rule | synthetic |
-| 05 | `06_series_only_rp` | RP + CNN with only the two series-value channels (no distance channel) on recall and the other tasks, plus depth 3 and smaller training sets. Result: partial (pre-registered): recall 0.933 vs 0.998 with D (0.973 at depth 3); D makes learning start ~12 epochs earlier and is needed at 5,000 training windows (0.970 vs 0.000) | synthetic |
-| 06 | `01_triplet_perimeter` | Perimeter TORP $T_{ijk} = d(x_i, y_j) + d(x_i, z_k) + d(y_j, z_k)$ (Euclidean) across three daily return series, for eight triplets chosen by correlation pattern (none, mid, high, one-out, mixed-sign); 10 yearly windows, m = 3, τ = 1, RR = 5 %, plus VIX sign-flip. Result: same-time dissimilarity $D_{sync}/D_{all}$ follows $\tfrac13\sum\sqrt{1-r}$ (Spearman 0.991); anti-correlation reads as dissimilarity, and high mixed-sign averages like no correlation (0.98 vs 0.97) though the thresholded tensor separates them (same-time RR 2.4× vs 1.3× base) | Yahoo daily ETFs and `^VIX`, 2015–2024 |
-| 06 | `triplet_dashboard.py` (script) | Builds `dashboard/torp_triplets.html` (open in a browser, no server): per triplet and yearly window, a 3D cloud of the daily z-scored returns with the (1, 1, 1) direction and the principal axis, the thresholded perimeter TORP on a movable sub-cube of (i, j, k) with the same-time diagonal marked, and the same-day dissimilarity $T_{ttt}$ through the window. Uses the notebook's ε and price cache; downloads Plotly.js once to `dashboard/vendor/` | output of `01_triplet_perimeter` |
-| 06 | `02_individual_rqa_torp` | Perimeter TORP on RQA vectors of each series (DET, L, ENTR, LAM, K2; sliding windows W = 250 every 10 days, per-series RR = 15 %), pooled z-score, Euclidean vs Mahalanobis. Result: features nearly one direction (L–ENTR 0.99); same-window closeness follows mean \|r\| (Spearman −0.81 Mahalanobis, n = 8) but not its sign, so high mixed-sign sits next to high +; crisis windows of 2020 dominate | Yahoo daily ETFs and `^VIX`, 2015–2024 |
-| 06 | `03_joint_rqa_torp` | Same on RQA vectors of the three pairwise joint RPs (joint RR kept), as excess over a null pair with one series shifted by 250 days; raw-feature comparison. Result: excess joint RR tracks \|r\| over 23 pairs (Spearman 0.94; signed r 0.36); same-window closeness of the three relationships follows mean \|r\| (−0.83) more than their unevenness (+0.43) | Yahoo daily ETFs and `^VIX`, 2015–2024 |
 
 ## Library (`src/recplay`)
 
@@ -123,17 +92,7 @@ Conventions: Euclidean distance unless stated; ε chosen per series so the recur
 (default 0.10); rates counted over upper-triangle pairs (i < j); a Theiler window is applied by only counting
 pairs with j − i ≥ `min_sep`.
 
-## Library (`src/rpjepa`)
-
-| Module | Contents |
-|---|---|
-| `data` | the six synthetic benchmark tasks (`make_task`, `TASKS`, `SYSTEM_CLASSES`), the unlabeled pretraining mixture, exact Lyapunov tables, `check_data` self-checks |
-| `diagnostics` | `sign` (window vs its negative) and `direction` (forward vs time-reversed) tasks that pairwise distances cannot solve |
-| `representations` | batched delay embedding, normalised distance matrix, RP inputs (`D`, `D+series`, `series`, `cos`, `RP@rr`, stacks), third-order RPs (`torp`: perimeter, generalised cosine) |
-| `features` | RQA + simple statistics feature table (parallel, uses `recplay.rqa`) |
-| `encoders`, `s4`, `recattn` | all encoders with one interface `forward(x, hide) -> [B, N, d]`: raw attention / conv / Hyena, RP CNN / S4ND / ViT, TORP 3D CNN / 3D S4ND, Gaussian recurrence attention (exact, or Based-style Taylor) |
-| `train`, `jepa`, `probe` | supervised training with early stopping, JEPA / multiscale JEPA / MAE pretraining with time and cell masks, frozen embeddings and linear probes |
-| `experiment` | deterministic split seeds, cached task splits, resumable per-run result cache |
+Dedicated JEPA tasks, training and probes live under [Experimental exploration](experimental_exploration/#jepa-pretraining).
 
 ## Data
 
@@ -145,15 +104,9 @@ pairs with j − i ≥ `min_sep`.
 | `data/raw/oecd_mei/` | FRED CSV downloads of OECD MEI CPI indices `<ISO>CPIALLMINMEI` (monthly, not seasonally adjusted) | Downloaded automatically by `CPI_direction_crosscountry` on first run (28 Oct 2026); most series end in early 2025, Japan in 2021 |
 | `data/raw/goyal_welch/Goyal_Welch_2025.xlsx` | Goyal & Welch equity-premium predictor data, 2025 update, `Monthly` sheet | 1871–2025 |
 | `data/raw/yahoo/` | yfinance timezone cache | Created automatically; prices are downloaded live and change between runs |
-| `data/raw/yahoo/triplet_prices_2015_2024.csv` | yfinance daily adjusted closes of the `06_torp` tickers, US trading days | Written by `01_triplet_perimeter` on first run; delete to re-download |
+| `data/raw/yahoo/triplet_prices_2015_2024.csv` | yfinance daily adjusted closes of the [TORP triplet](experimental_exploration/torps/) tickers, US trading days | Written by `01_triplet_perimeter` on first run; delete to re-download |
 | `data/raw/stock_trend_tushare/` | Tushare `stk_mins`, `trade_cal`, `daily` | Raw gzip CSV responses with metadata/SHA256 checks; no historical data supplied |
 | `data/processed/stock_trend_repro/{full,smoke}/` | Stock-trend notebook | Code/input-fingerprinted RQA caches, epoch selections, neural checkpoints and predictions; synthetic smoke kept separate |
-| `data/processed/rp_screening/` | Caches of the screening notebooks: `iaaft/` window surrogates (shared), `euclidean/` and `beta/` RQA and RRc features | Delete a folder after changing the code that builds it |
-| `data/processed/monthly_pi/` | Cache of `CPI_direction_monthlyRP_horizons`: `iaaft/` surrogates of monthly-inflation windows, `rqa/` and `rrc/` features | Delete after changing the code that builds it |
-| `data/processed/beta_refinement/` | Cache of `CPI_direction_betaRP_refinement`: `iaaft/` surrogates, `rqa/` and `rrc/` features per arm (β or Euclidean) | Delete after changing the code that builds it |
-| `data/processed/embedding_sweep/` | Cache of `CPI_direction_embedding_sweep`: `iaaft/` surrogates, `rqa/` and `rrc/` features per (m, τ, arm) | Delete after changing the code that builds it |
-| `data/processed/crosscountry/` | Cache of `CPI_direction_crosscountry`: RQA/RRc features per country | Delete after changing the code that builds it |
-| `data/processed/jepa/` | Caches of `05_jepa`: generated task splits (`tasks/`), Lyapunov tables, per-run results (`step1/`, `step2/`; notebooks `05` and `06` also write their training runs to `step2/`), pretrained encoders and logs (`step3/`, `step4/`), `smoke/` copies | Delete a step's folder after changing the code it depends on |
 
 ## Results
 
@@ -162,9 +115,6 @@ pairs with j − i ≥ `min_sep`.
 | `results/tables/det_predictability_results.csv` | `DETPredictability` |
 | `results/tables/det_predictability_window_sweep.csv` | `DETPredictability` |
 | `results/tables/stock_trend_repro/{full,smoke}/<run hash>/` | `Stock_trend_RQA_transposed_transformer`: predictions, seed/stock summaries, published-reference comparisons, ablations, coverage, manifest and diagnostic figures; full-mode `missing_data.csv` lists unavailable source ranges |
-| `results/tables/jepa/step{1,…,6}/` | the six `05_jepa` notebooks: result tables, `figures/` and, for steps 5–6, the full-run `run.log` |
-| `notebooks/tables/torp_triplets/` | `01_triplet_perimeter`: per-window and summary tables, embedding diagnostics, `figures/` |
-| `notebooks/tables/torp_rqa_individual/`, `notebooks/tables/torp_rqa_joint/` | `02_individual_rqa_torp`, `03_joint_rqa_torp`: summary per triplet and distance variant, same-window dissimilarity per window, relation to the correlation pattern, `figures/` (joint: also `pair_dependence.csv`) |
 
 ## References
 

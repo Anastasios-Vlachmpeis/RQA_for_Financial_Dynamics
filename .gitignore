@@ -1,7 +1,13 @@
 /.venv
 /.venv-stock-repro
 /.venv-stock-repro312
-/.venv-jepa
+/experimental_exploration/jepa_pretraining/.venv-jepa/
+/experimental_exploration/*/cache/
+/experimental_exploration/*/tables/*
+!/experimental_exploration/rho_perc/tables/P0/
+/experimental_exploration/rho_perc/tables/P0/*
+!/experimental_exploration/rho_perc/tables/P0/spec.json
+/experimental_exploration/**/__pycache__/
 /anaconda_projects
 /.idea
 /tec.txt
